@@ -1,0 +1,918 @@
+Directory structure:
+└── kokoro-runpod-tts/
+    ├── Dockerfile
+    ├── handler.py
+    ├── requirements.txt
+    ├── test_client.py
+    └── .github/
+        └── workflows/
+            └── docker-build.yml
+
+================================================
+File: Dockerfile
+================================================
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+
+# Set working directory
+WORKDIR /app
+
+# GPU optimization environment variables
+ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+ENV CUDA_LAUNCH_BLOCKING=0
+ENV CUDA_CACHE_DISABLE=0
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    espeak-ng \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+
+# Install Python packages with GPU optimizations
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copy handler
+COPY handler.py .
+
+# Optional: Pre-download models during build for faster cold starts
+# This adds ~2GB to image but eliminates model download latency
+RUN python -c "from kokoro import KPipeline; print('Pre-loading models...'); KPipeline(lang_code='a'); KPipeline(lang_code='b'); print('Models pre-loaded')" || echo "Model pre-loading failed, will load at runtime"
+
+# Warm up GPU and PyTorch
+RUN python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU count: {torch.cuda.device_count()}'); torch.cuda.empty_cache() if torch.cuda.is_available() else None"
+
+# Create non-root user for security (optional)
+# RUN groupadd -r kokoro && useradd -r -g kokoro kokoro
+# USER kokoro
+
+# Expose WebSocket port
+EXPOSE 8000
+
+# Health check to ensure GPU is working
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python -c "import torch; exit(0 if torch.cuda.is_available() else 1)" || exit 1
+
+# Run the handler with optimizations
+CMD ["python", "-u", "handler.py"]
+
+
+================================================
+File: handler.py
+================================================
+#!/usr/bin/env python3
+"""
+GPU Diagnostic Handler - Ensures actual GPU usage for inference
+"""
+
+import runpod
+import base64
+import time
+import numpy as np
+import json
+from typing import Dict, Generator, Any, Optional
+import logging
+import os
+
+# Minimal logging
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
+
+# Force GPU usage
+import torch
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+    
+    # Aggressive GPU settings
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_num_threads(1)
+    
+    # Force all operations to GPU
+    torch.cuda.set_device(0)
+    DEVICE = torch.device("cuda:0")
+    
+    # Test GPU computation
+    test_tensor = torch.randn(1000, 1000, device=DEVICE)
+    _ = torch.mm(test_tensor, test_tensor)
+    torch.cuda.synchronize()
+    print(f"✅ GPU computation test passed")
+    
+else:
+    DEVICE = torch.device("cpu")
+    print("⚠️ CUDA not available, using CPU")
+
+# Import Kokoro
+try:
+    from kokoro import KModel, KPipeline
+except ImportError:
+    logger.error("Kokoro not installed")
+    raise
+
+# Global state
+SHARED_MODEL = None
+PIPELINES = {}
+LOAD_START_TIME = time.perf_counter()
+
+def force_gpu_usage():
+    """Force all Kokoro operations to use GPU"""
+    global SHARED_MODEL, PIPELINES
+    
+    try:
+        logger.warning("Initializing Kokoro with forced GPU usage...")
+        start = time.perf_counter()
+        
+        # Create model and immediately move to GPU
+        SHARED_MODEL = KModel().eval()
+        
+        if torch.cuda.is_available():
+            print(f"Moving model to GPU: {DEVICE}")
+            SHARED_MODEL = SHARED_MODEL.to(DEVICE)
+            
+            # Verify model is on GPU
+            for name, param in SHARED_MODEL.named_parameters():
+                if not param.is_cuda:
+                    print(f"⚠️ Parameter {name} not on GPU!")
+                    param.data = param.data.to(DEVICE)
+            
+            # Force GPU memory allocation
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            
+            # Test inference to ensure GPU usage
+            print("Testing GPU inference...")
+            dummy_input = torch.LongTensor([[0, 1, 2, 0]]).to(DEVICE)
+            dummy_ref = torch.randn(1, 256).to(DEVICE)
+            
+            with torch.no_grad():
+                _ = SHARED_MODEL.forward_with_tokens(dummy_input, dummy_ref, 1.0)
+            
+            torch.cuda.synchronize()
+            print(f"✅ GPU inference test completed")
+        
+        model_time = time.perf_counter() - start
+        logger.warning(f"Model loaded and GPU-optimized in {model_time:.2f}s")
+        
+        # Initialize pipelines with explicit GPU device
+        languages = {'a': 'American English', 'b': 'British English'}
+        
+        for lang_code, lang_name in languages.items():
+            try:
+                pipeline_start = time.perf_counter()
+                
+                # Create pipeline with explicit device
+                pipeline = KPipeline(
+                    lang_code=lang_code,
+                    model=SHARED_MODEL,
+                    device='cuda' if torch.cuda.is_available() else 'cpu'
+                )
+                
+                # Pre-load and move voices to GPU
+                common_voices = get_common_voices(lang_code)
+                for voice in common_voices:
+                    try:
+                        voice_tensor = pipeline.load_voice(voice)
+                        if torch.cuda.is_available():
+                            # Ensure voice tensor is on GPU
+                            voice_tensor = voice_tensor.to(DEVICE)
+                            pipeline.voices[voice] = voice_tensor
+                    except Exception as e:
+                        print(f"⚠️ Voice {voice} loading failed: {e}")
+                
+                PIPELINES[lang_code] = pipeline
+                pipeline_time = time.perf_counter() - pipeline_start
+                logger.warning(f"Pipeline {lang_name} ready in {pipeline_time:.2f}s")
+                
+            except Exception as e:
+                logger.error(f"Failed to initialize {lang_name}: {e}")
+        
+        # Final GPU memory check
+        if torch.cuda.is_available():
+            memory_allocated = torch.cuda.memory_allocated() / 1024**3
+            memory_reserved = torch.cuda.memory_reserved() / 1024**3
+            print(f"📊 GPU Memory - Allocated: {memory_allocated:.2f}GB, Reserved: {memory_reserved:.2f}GB")
+        
+        total_time = time.perf_counter() - LOAD_START_TIME
+        logger.warning(f"Complete GPU initialization in {total_time:.2f}s")
+        
+    except Exception as e:
+        logger.error(f"GPU initialization failed: {e}")
+        raise
+
+def get_common_voices(lang_code: str) -> list:
+    """Get common voices for pre-loading"""
+    return {
+        'a': ['af_bella', 'af_sarah', 'am_adam'],
+        'b': ['bf_emma', 'bm_george']
+    }.get(lang_code, ['af_bella'])
+
+def create_minimal_alignment(text: str, audio_duration_ms: float) -> dict:
+    """Fast alignment calculation"""
+    if not text:
+        return {"chars": [], "charStartTimesMs": [], "charsDurationsMs": []}
+    
+    char_count = len(text)
+    char_duration = audio_duration_ms / char_count
+    
+    return {
+        "chars": list(text),
+        "charStartTimesMs": [int(i * char_duration) for i in range(char_count)],
+        "charsDurationsMs": [int(char_duration)] * char_count
+    }
+
+def gpu_diagnostic_handler(job: Dict[str, Any]) -> Generator[Dict[str, Any], None, None]:
+    """Handler with GPU diagnostics"""
+    job_start = time.perf_counter()
+    
+    try:
+        job_input = job["input"]
+        
+        # Enhanced health check with GPU info
+        if job_input.get("health_check"):
+            gpu_info = {"gpu_available": False}
+            
+            if torch.cuda.is_available():
+                gpu_info = {
+                    "gpu_available": True,
+                    "gpu_name": torch.cuda.get_device_name(0),
+                    "gpu_memory_total": f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB",
+                    "gpu_memory_allocated": f"{torch.cuda.memory_allocated() / 1024**3:.2f}GB",
+                    "gpu_memory_reserved": f"{torch.cuda.memory_reserved() / 1024**3:.2f}GB",
+                    "device": str(DEVICE),
+                    "model_on_gpu": next(SHARED_MODEL.parameters()).is_cuda if SHARED_MODEL else False
+                }
+            
+            yield {
+                "status": "healthy",
+                "models_loaded": list(PIPELINES.keys()),
+                "mode": "gpu_diagnostic",
+                "shared_model": SHARED_MODEL is not None,
+                **gpu_info
+            }
+            return
+        
+        # Route requests
+        if "text" in job_input:
+            yield from handle_gpu_tts(job_input, job_start)
+        elif "websocket_message" in job_input:
+            yield from handle_gpu_websocket(job_input, job_start)
+        elif "messages" in job_input:
+            yield from handle_gpu_conversation(job_input, job_start)
+        else:
+            yield {"error": "Invalid input"}
+            
+    except Exception as e:
+        yield {"error": str(e)}
+
+def handle_gpu_tts(job_input: Dict[str, Any], job_start: float) -> Generator[Dict[str, Any], None, None]:
+    """TTS with GPU diagnostics"""
+    text = job_input.get("text", "")
+    if not text:
+        yield {"error": "No text"}
+        return
+    
+    voice_id = job_input.get("voice_id", "af_bella")
+    voice_settings = job_input.get("voice_settings", {})
+    context_id = f"gpu{int(time.perf_counter() * 1000000) & 0xFFFFFF}"
+    
+    yield from generate_with_gpu_monitoring(text, voice_id, voice_settings, context_id, job_start)
+
+def handle_gpu_websocket(job_input: Dict[str, Any], job_start: float) -> Generator[Dict[str, Any], None, None]:
+    """WebSocket with GPU monitoring"""
+    ws_msg = job_input.get("websocket_message", {})
+    text = ws_msg.get("text", "").strip()
+    context_id = ws_msg.get("context_id") or f"ws{int(time.perf_counter() * 1000000) & 0xFFFFFF}"
+    voice_settings = ws_msg.get("voice_settings", {})
+    voice_id = job_input.get("voice_id", "af_bella")
+    
+    # Control messages
+    if ws_msg.get("close_socket"):
+        yield {"type": "socket_closed", "contextId": context_id}
+        return
+    if ws_msg.get("close_context"):
+        yield {"type": "context_closed", "contextId": context_id}
+        return
+    if text == " ":
+        yield {"type": "context_initialized", "contextId": context_id}
+        return
+    if not text:
+        yield {"type": "empty_message", "contextId": context_id}
+        return
+    
+    yield from generate_with_gpu_monitoring(text, voice_id, voice_settings, context_id, job_start)
+
+def handle_gpu_conversation(job_input: Dict[str, Any], job_start: float) -> Generator[Dict[str, Any], None, None]:
+    """Conversation with GPU monitoring"""
+    messages = job_input.get("messages", [])
+    if not messages:
+        return
+        
+    context_id = f"cv{int(time.perf_counter() * 1000000) & 0xFFFFFF}"
+    voice_id = job_input.get("voice_id", "af_bella")
+    voice_settings = job_input.get("voice_settings", {})
+    
+    yield {"type": "connection_established", "contextId": context_id}
+    
+    for i, message in enumerate(messages):
+        text = message if isinstance(message, str) else message.get("text", "").strip()
+        if not text:
+            continue
+        
+        yield {"type": "message_start", "contextId": context_id, "message_index": i}
+        yield from generate_with_gpu_monitoring(text, voice_id, voice_settings, context_id, job_start, i)
+        yield {"type": "message_complete", "contextId": context_id, "message_index": i}
+
+def generate_with_gpu_monitoring(
+    text: str,
+    voice_id: str,
+    voice_settings: Dict[str, Any],
+    context_id: str,
+    job_start: float,
+    message_index: Optional[int] = None
+) -> Generator[Dict[str, Any], None, float]:
+    """Generate audio with GPU utilization monitoring"""
+    
+    # Select pipeline
+    lang_code = voice_id[0] if voice_id and voice_id[0] in PIPELINES else 'a'
+    pipeline = PIPELINES.get(lang_code, PIPELINES['a'])
+    speed = voice_settings.get("speed", 1.0)
+    
+    chunk_count = 0
+    first_chunk_time = None
+    generation_start = time.perf_counter()
+    audio_chunks = []
+    
+    # Monitor GPU before generation
+    gpu_memory_before = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+    
+    try:
+        # Force GPU computation
+        if torch.cuda.is_available():
+            # Ensure voice is on GPU
+            voice_tensor = pipeline.load_voice(voice_id)
+            if not voice_tensor.is_cuda:
+                voice_tensor = voice_tensor.to(DEVICE)
+                pipeline.voices[voice_id] = voice_tensor
+        
+        # Generate with forced GPU usage
+        for result in pipeline(text, voice=voice_id, speed=speed):
+            if first_chunk_time is None:
+                first_chunk_time = time.perf_counter() - job_start
+                
+                yield {
+                    "type": "first_chunk",
+                    "contextId": context_id,
+                    "latency_ms": int(first_chunk_time * 1000),
+                    "gpu_memory_before": f"{gpu_memory_before:.2f}GB"
+                }
+            
+            if result.audio is not None:
+                chunk_count += 1
+                
+                # Force GPU synchronization
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                # Convert audio
+                audio_np = result.audio.detach().cpu().numpy() if hasattr(result.audio, 'detach') else result.audio.numpy()
+                audio_bytes = (audio_np * 32767).astype(np.int16).tobytes()
+                audio_chunks.append(audio_np)
+                
+                chunk_data = {
+                    "audio": base64.b64encode(audio_bytes).decode('utf-8'),
+                    "contextId": context_id,
+                    "isFinal": False,
+                    "chunk_number": chunk_count,
+                    "sample_rate": 24000
+                }
+                
+                if message_index is not None:
+                    chunk_data["message_index"] = message_index
+                    
+                yield chunk_data
+        
+        # Final metrics with GPU info
+        if audio_chunks:
+            full_audio = np.concatenate(audio_chunks)
+            audio_duration = len(full_audio) / 24000.0
+            generation_time = time.perf_counter() - generation_start
+            
+            gpu_memory_after = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
+            
+            yield {"alignment": create_minimal_alignment(text, audio_duration * 1000), "contextId": context_id}
+            
+            yield {
+                "isFinal": True,
+                "contextId": context_id,
+                "metadata": {
+                    "total_chunks": chunk_count,
+                    "audio_duration_ms": int(audio_duration * 1000),
+                    "generation_time_ms": int(generation_time * 1000),
+                    "real_time_factor": generation_time / audio_duration if audio_duration > 0 else 0,
+                    "gpu_used": torch.cuda.is_available(),
+                    "gpu_memory_before": f"{gpu_memory_before:.2f}GB",
+                    "gpu_memory_after": f"{gpu_memory_after:.2f}GB",
+                    "model_device": str(next(SHARED_MODEL.parameters()).device) if SHARED_MODEL else "unknown"
+                }
+            }
+            
+            return audio_duration
+        
+        return 0.0
+            
+    except Exception as e:
+        yield {"error": str(e), "contextId": context_id}
+        return 0.0
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+# Initialize with forced GPU usage
+force_gpu_usage()
+
+# Start RunPod
+runpod.serverless.start({
+    "handler": gpu_diagnostic_handler,
+    "return_aggregate_stream": True
+})
+
+
+================================================
+File: requirements.txt
+================================================
+runpod==1.6.2
+kokoro>=0.9.4
+soundfile==0.12.1
+numpy==1.24.3
+torch==2.1.0
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+websockets==12.0
+pydantic==2.5.0
+
+
+================================================
+File: test_client.py
+================================================
+#!/usr/bin/env python3
+"""
+Real Text Audio Test Client - Test with realistic content and audio playback
+"""
+
+import asyncio
+import aiohttp
+import json
+import time
+import argparse
+import base64
+import numpy as np
+from typing import List, Dict, Any
+
+# Audio playback
+try:
+    import sounddevice as sd
+    AUDIO_PLAYBACK = True
+    print("🔊 Audio playback enabled")
+except ImportError:
+    AUDIO_PLAYBACK = False
+    print("⚠️  Audio playback disabled (install sounddevice)")
+
+try:
+    import soundfile as sf
+    AUDIO_SAVE = True
+    print("💾 Audio saving enabled")
+except ImportError:
+    AUDIO_SAVE = False
+    print("⚠️  Audio saving disabled (install soundfile)")
+
+class RealTextTester:
+    def __init__(self, endpoint_id: str, api_key: str):
+        self.endpoint_id = endpoint_id
+        self.api_key = api_key
+        self.run_url = f"https://api.runpod.ai/v2/{endpoint_id}/run"
+        self.headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        self.audio_chunks = []
+        
+    async def test_real_scenarios(self):
+        """Test with realistic TTS scenarios"""
+        print("🎭 REAL-WORLD TTS PERFORMANCE TEST")
+        print("=" * 60)
+        
+        scenarios = [
+            {
+                "name": "📰 News Headline",
+                "text": "Breaking news: Scientists have made a groundbreaking discovery in renewable energy technology that could revolutionize how we power our cities.",
+                "voice": "af_bella",
+                "speed": 1.0
+            },
+            {
+                "name": "🏢 Business Presentation",
+                "text": "Good morning everyone. Today's quarterly results show a significant increase in customer satisfaction, with our net promoter score rising to 8.7 out of 10.",
+                "voice": "am_adam", 
+                "speed": 0.9
+            },
+            {
+                "name": "📚 Educational Content",
+                "text": "Artificial intelligence is transforming industries worldwide. Machine learning algorithms can now process vast amounts of data to identify patterns humans might miss.",
+                "voice": "af_sarah",
+                "speed": 1.1
+            },
+            {
+                "name": "🎧 Podcast Intro",
+                "text": "Welcome back to Tech Talk Tuesday! I'm your host, and today we're diving deep into the fascinating world of voice synthesis technology.",
+                "voice": "am_michael",
+                "speed": 1.0
+            },
+            {
+                "name": "📖 Audiobook Sample",
+                "text": "It was the best of times, it was the worst of times. The year 2025 brought unprecedented changes to how we communicate with machines.",
+                "voice": "bf_emma",
+                "speed": 0.8
+            }
+        ]
+        
+        results = []
+        
+        for i, scenario in enumerate(scenarios, 1):
+            print(f"\n🎯 Test {i}/5: {scenario['name']}")
+            print(f"📝 Text: {scenario['text']}")
+            print(f"🎤 Voice: {scenario['voice']} (Speed: {scenario['speed']}x)")
+            
+            result = await self._test_scenario(scenario)
+            results.append(result)
+            
+            if result and AUDIO_PLAYBACK:
+                print("🔊 Playing generated audio...")
+                self._play_audio()
+                
+            if result and AUDIO_SAVE:
+                filename = f"test_{i}_{scenario['voice']}.wav"
+                self._save_audio(filename)
+                
+            # Clear audio for next test
+            self.audio_chunks = []
+            
+            # Brief pause between tests
+            await asyncio.sleep(1)
+        
+        # Show summary
+        self._show_performance_summary(results)
+        
+    async def _test_scenario(self, scenario: Dict[str, Any]) -> Dict[str, Any]:
+        """Test a single TTS scenario"""
+        payload = {
+            "input": {
+                "text": scenario["text"],
+                "voice_id": scenario["voice"],
+                "voice_settings": {
+                    "speed": scenario["speed"]
+                }
+            }
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            start_time = time.perf_counter()
+            
+            try:
+                # Submit job
+                async with session.post(self.run_url, json=payload, headers=self.headers) as response:
+                    if response.status != 200:
+                        print(f"❌ Request failed: {response.status}")
+                        return None
+                    
+                    result = await response.json()
+                    job_id = result.get("id")
+                    
+                    submit_time = time.perf_counter() - start_time
+                    print(f"📤 Submitted in: {submit_time:.3f}s")
+                    
+                    # Stream results
+                    metrics = await self._process_stream(session, job_id, start_time)
+                    
+                    return {
+                        "scenario": scenario["name"],
+                        "text_length": len(scenario["text"]),
+                        "voice": scenario["voice"],
+                        "speed": scenario["speed"],
+                        **metrics
+                    }
+                    
+            except Exception as e:
+                print(f"❌ Error: {e}")
+                return None
+    
+    async def _process_stream(self, session: aiohttp.ClientSession, job_id: str, start_time: float) -> Dict[str, Any]:
+        """Process streaming response and collect metrics"""
+        stream_url = f"https://api.runpod.ai/v2/{self.endpoint_id}/stream/{job_id}"
+        
+        metrics = {
+            "first_chunk_latency_ms": None,
+            "total_time_s": None,
+            "audio_duration_ms": None,
+            "real_time_factor": None,
+            "chunks_received": 0,
+            "gpu_used": False
+        }
+        
+        while True:
+            async with session.get(stream_url, headers=self.headers) as response:
+                stream_data = await response.json()
+                
+                if stream_data["status"] == "COMPLETED":
+                    metrics["total_time_s"] = time.perf_counter() - start_time
+                    print(f"✅ Completed in: {metrics['total_time_s']:.3f}s")
+                    break
+                
+                elif stream_data["status"] == "FAILED":
+                    print(f"❌ Failed: {stream_data.get('error')}")
+                    break
+                
+                elif stream_data["status"] == "IN_PROGRESS":
+                    if "stream" in stream_data and stream_data["stream"]:
+                        for item in stream_data["stream"]:
+                            output = item.get("output", item)
+                            
+                            # Process events
+                            if output.get("type") == "first_chunk":
+                                metrics["first_chunk_latency_ms"] = output.get("latency_ms")
+                                print(f"⚡ First chunk: {metrics['first_chunk_latency_ms']}ms")
+                            
+                            # Process audio
+                            elif "audio" in output:
+                                metrics["chunks_received"] += 1
+                                try:
+                                    audio_data = base64.b64decode(output["audio"])
+                                    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                                    self.audio_chunks.append(audio_array)
+                                    
+                                    if metrics["chunks_received"] <= 3:
+                                        print(f"🎵 Audio chunk {metrics['chunks_received']}: {len(audio_data)} bytes")
+                                    elif metrics["chunks_received"] == 4:
+                                        print(f"🎵 ... (+{metrics['chunks_received']-3} more chunks)")
+                                        
+                                except Exception as e:
+                                    print(f"⚠️  Audio decode error: {e}")
+                            
+                            # Process completion
+                            elif output.get("isFinal"):
+                                metadata = output.get("metadata", {})
+                                metrics["audio_duration_ms"] = metadata.get("audio_duration_ms")
+                                metrics["real_time_factor"] = metadata.get("real_time_factor")
+                                metrics["gpu_used"] = metadata.get("gpu_used", False)
+                                
+                                print(f"🏁 Audio: {metrics['audio_duration_ms']}ms, RTF: {metrics['real_time_factor']:.3f}")
+            
+            await asyncio.sleep(0.05)  # Faster polling for real-time feel
+        
+        return metrics
+    
+    def _play_audio(self):
+        """Play combined audio chunks"""
+        if not AUDIO_PLAYBACK or not self.audio_chunks:
+            return
+        
+        try:
+            combined_audio = np.concatenate(self.audio_chunks)
+            duration = len(combined_audio) / 24000
+            print(f"🔊 Playing {duration:.2f}s of audio...")
+            
+            sd.play(combined_audio, samplerate=24000)
+            sd.wait()  # Wait for playback to complete
+            
+        except Exception as e:
+            print(f"⚠️  Playback error: {e}")
+    
+    def _save_audio(self, filename: str):
+        """Save audio to file"""
+        if not AUDIO_SAVE or not self.audio_chunks:
+            return
+        
+        try:
+            combined_audio = np.concatenate(self.audio_chunks)
+            audio_float = combined_audio.astype(np.float32) / 32767.0
+            sf.write(filename, audio_float, 24000)
+            print(f"💾 Saved: {filename}")
+        except Exception as e:
+            print(f"⚠️  Save error: {e}")
+    
+    def _show_performance_summary(self, results: List[Dict[str, Any]]):
+        """Show comprehensive performance summary"""
+        print("\n" + "=" * 60)
+        print("📊 PERFORMANCE SUMMARY")
+        print("=" * 60)
+        
+        valid_results = [r for r in results if r is not None]
+        
+        if not valid_results:
+            print("❌ No successful tests to analyze")
+            return
+        
+        # Calculate averages
+        avg_first_chunk = np.mean([r["first_chunk_latency_ms"] for r in valid_results if r["first_chunk_latency_ms"]])
+        avg_total_time = np.mean([r["total_time_s"] for r in valid_results if r["total_time_s"]])
+        avg_rtf = np.mean([r["real_time_factor"] for r in valid_results if r["real_time_factor"]])
+        total_chunks = sum([r["chunks_received"] for r in valid_results])
+        
+        print(f"\n🎯 OVERALL PERFORMANCE:")
+        print(f"   Average First Chunk Latency: {avg_first_chunk:.1f}ms")
+        print(f"   Average Total Time: {avg_total_time:.2f}s")
+        print(f"   Average Real-time Factor: {avg_rtf:.3f}x")
+        print(f"   Total Audio Chunks: {total_chunks}")
+        print(f"   GPU Used: {'✅' if any(r['gpu_used'] for r in valid_results) else '❌'}")
+        
+        print(f"\n📋 DETAILED RESULTS:")
+        for r in valid_results:
+            print(f"   {r['scenario']:<25} | {r['first_chunk_latency_ms']:>3.0f}ms | {r['real_time_factor']:>5.3f}x RTF | {r['voice']}")
+        
+        # Performance rating
+        if avg_first_chunk < 100:
+            rating = "🚀 EXCELLENT"
+        elif avg_first_chunk < 200:
+            rating = "✅ VERY GOOD"
+        elif avg_first_chunk < 300:
+            rating = "👍 GOOD"
+        else:
+            rating = "⚠️  NEEDS IMPROVEMENT"
+        
+        print(f"\n🏆 PERFORMANCE RATING: {rating}")
+        print(f"   (Based on {avg_first_chunk:.0f}ms average first chunk latency)")
+
+    async def test_conversation_flow(self):
+        """Test realistic conversation scenario"""
+        print("\n" + "=" * 60)
+        print("💬 CONVERSATION FLOW TEST")
+        print("=" * 60)
+        
+        conversation = [
+            "Hello! Welcome to our AI assistant demo.",
+            "I can help you with various tasks today.",
+            "What would you like to know about our voice technology?",
+            "Our system processes speech in real-time with minimal delay.",
+            "Thank you for trying our advanced text-to-speech service!"
+        ]
+        
+        payload = {
+            "input": {
+                "messages": conversation,
+                "voice_id": "af_bella",
+                "voice_settings": {"speed": 1.0}
+            }
+        }
+        
+        print(f"🗣️  Testing {len(conversation)} message conversation...")
+        
+        async with aiohttp.ClientSession() as session:
+            start_time = time.perf_counter()
+            
+            async with session.post(self.run_url, json=payload, headers=self.headers) as response:
+                if response.status != 200:
+                    print(f"❌ Conversation test failed: {response.status}")
+                    return
+                
+                result = await response.json()
+                job_id = result.get("id")
+                
+                # Process conversation stream
+                stream_url = f"https://api.runpod.ai/v2/{self.endpoint_id}/stream/{job_id}"
+                message_latencies = []
+                
+                while True:
+                    async with session.get(stream_url, headers=self.headers) as stream_response:
+                        stream_data = await stream_response.json()
+                        
+                        if stream_data["status"] == "COMPLETED":
+                            total_time = time.perf_counter() - start_time
+                            print(f"✅ Conversation completed in: {total_time:.2f}s")
+                            break
+                        
+                        elif stream_data["status"] == "IN_PROGRESS":
+                            if "stream" in stream_data and stream_data["stream"]:
+                                for item in stream_data["stream"]:
+                                    output = item.get("output", item)
+                                    
+                                    if output.get("type") == "first_chunk":
+                                        msg_idx = output.get("message_index", "?")
+                                        latency = output.get("latency_ms")
+                                        message_latencies.append(latency)
+                                        print(f"   💬 Message {msg_idx}: {latency}ms first chunk")
+                                    
+                                    elif "audio" in output:
+                                        try:
+                                            audio_data = base64.b64decode(output["audio"])
+                                            audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                                            self.audio_chunks.append(audio_array)
+                                        except:
+                                            pass
+                        
+                        await asyncio.sleep(0.05)
+        
+        # Play the full conversation
+        if AUDIO_PLAYBACK and self.audio_chunks:
+            print("🔊 Playing full conversation...")
+            self._play_audio()
+        
+        if AUDIO_SAVE and self.audio_chunks:
+            self._save_audio("conversation_test.wav")
+        
+        # Show conversation metrics
+        if message_latencies:
+            avg_latency = np.mean(message_latencies)
+            print(f"\n📊 CONVERSATION METRICS:")
+            print(f"   Average message latency: {avg_latency:.1f}ms")
+            print(f"   Latency consistency: {np.std(message_latencies):.1f}ms std dev")
+
+async def main():
+    parser = argparse.ArgumentParser(description="Real Text Audio Test for Kokoro TTS")
+    parser.add_argument("--endpoint-id", required=True, help="RunPod endpoint ID")
+    parser.add_argument("--api-key", required=True, help="RunPod API key")
+    parser.add_argument("--test", choices=["scenarios", "conversation", "all"], default="all")
+    
+    args = parser.parse_args()
+    
+    tester = RealTextTester(args.endpoint_id, args.api_key)
+    
+    if args.test in ["scenarios", "all"]:
+        await tester.test_real_scenarios()
+    
+    if args.test in ["conversation", "all"]:
+        await tester.test_conversation_flow()
+    
+    print(f"\n🎉 Testing complete!")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+================================================
+File: .github/workflows/docker-build.yml
+================================================
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    
+    - name: Login to Docker Hub
+      uses: docker/login-action@v2
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_TOKEN }}
+    
+    - name: Generate unique tag
+      id: tags
+      run: |
+        # Generate timestamp-based tag
+        TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+        
+        # Get short SHA
+        SHORT_SHA=$(echo ${GITHUB_SHA} | cut -c1-7)
+        
+        # Get branch name (replace / with -)
+        BRANCH_NAME=$(echo ${GITHUB_REF#refs/heads/} | sed 's/\//-/g')
+        
+        # Create multiple tag variants
+        echo "timestamp=${TIMESTAMP}" >> $GITHUB_OUTPUT
+        echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+        echo "branch=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+        
+        # Combined tags
+        echo "version=${BRANCH_NAME}-${TIMESTAMP}-${SHORT_SHA}" >> $GITHUB_OUTPUT
+        echo "simple=${TIMESTAMP}-${SHORT_SHA}" >> $GITHUB_OUTPUT
+        echo "date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+    
+    - name: Build and push
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        push: true
+        tags: |
+          ${{ secrets.DOCKER_USERNAME }}/kokoro-tts:latest
+          ${{ secrets.DOCKER_USERNAME }}/kokoro-tts:${{ steps.tags.outputs.version }}
+          ${{ secrets.DOCKER_USERNAME }}/kokoro-tts:${{ steps.tags.outputs.simple }}
+          ${{ secrets.DOCKER_USERNAME }}/kokoro-tts:build-${{ github.run_number }}
+          ${{ secrets.DOCKER_USERNAME }}/kokoro-tts:sha-${{ steps.tags.outputs.sha }}
+          ${{ secrets.DOCKER_USERNAME }}/kokoro-tts:${{ steps.tags.outputs.date }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
