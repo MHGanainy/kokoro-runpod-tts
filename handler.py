@@ -77,7 +77,10 @@ def initialize_pipelines():
             
             # Warm up with dummy inference
             logger.info(f"Warming up {lang_name} model...")
-            list(pipeline("test", voice='af_bella'))
+            try:
+                list(pipeline("test", voice='af_bella'))
+            except Exception as e:
+                logger.warning(f"Warm-up warning for {lang_name}: {e}")
             
             PIPELINES[lang_code] = pipeline
             logger.info(f"Loaded {lang_name} in {time.time() - start:.2f}s")
@@ -235,11 +238,17 @@ async def websocket_elevenlabs_compatible(
             
             try:
                 for graphemes, phonemes, audio in pipeline(text, voice=voice_id, speed=speed):
+                    # Convert PyTorch tensor to NumPy array if needed
+                    if hasattr(audio, 'cpu'):  # It's a PyTorch tensor
+                        audio_np = audio.cpu().numpy()
+                    else:
+                        audio_np = audio
+                    
                     # Convert to PCM16
-                    audio_pcm = (audio * 32767).astype(np.int16)
+                    audio_pcm = (audio_np * 32767).astype(np.int16)
                     audio_bytes = audio_pcm.tobytes()
-                    audio_chunks.append(audio)
-                    total_samples += len(audio)
+                    audio_chunks.append(audio_np)
+                    total_samples += len(audio_np)
                     
                     # Send audio chunk immediately
                     chunk_message = {
@@ -340,13 +349,19 @@ def generator_handler(job: Dict[str, Any]) -> Generator[Dict[str, Any], None, No
             if first_chunk_time is None:
                 first_chunk_time = time.time() - job_start
             
+            # Convert PyTorch tensor to NumPy array if needed
+            if hasattr(audio, 'cpu'):  # It's a PyTorch tensor
+                audio_np = audio.cpu().numpy()
+            else:
+                audio_np = audio
+            
             # Convert to PCM16
-            audio_pcm = (audio * 32767).astype(np.int16)
+            audio_pcm = (audio_np * 32767).astype(np.int16)
             audio_bytes = audio_pcm.tobytes()
-            audio_chunks.append(audio)
+            audio_chunks.append(audio_np)
             
             chunk_count += 1
-            total_samples += len(audio)
+            total_samples += len(audio_np)
             
             # Stream each chunk
             if streaming:
