@@ -27,38 +27,38 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
 # Set working directory
 WORKDIR /app
 
-# Copy dependency files
-COPY pyproject.toml ./pyproject.toml
+# Clone Kokoro-FastAPI repository
+RUN git clone https://github.com/remsky/Kokoro-FastAPI.git kokoro-fastapi
+
+# Set working directory to the cloned repo
+WORKDIR /app/kokoro-fastapi
 
 # Set environment variables for phonemizer
 ENV PHONEMIZER_ESPEAK_PATH=/usr/bin \
     PHONEMIZER_ESPEAK_DATA=/usr/share/espeak-ng-data \
     ESPEAK_DATA_PATH=/usr/share/espeak-ng-data
 
-# Install dependencies with GPU extras
+# Install dependencies with GPU extras using UV
 RUN uv venv --python 3.10 && \
     uv sync --extra gpu
 
-# Copy project files
-COPY api ./api
-
 # Download the model
-COPY download_model.py ./
-RUN python download_model.py --output api/src/models/v1_0
+RUN /app/kokoro-fastapi/.venv/bin/python docker/scripts/download_model.py --output api/src/models/v1_0
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app:/app/api \
-    PATH="/app/.venv/bin:$PATH" \
+    PYTHONPATH=/app/kokoro-fastapi:/app/kokoro-fastapi/api \
+    PATH="/app/kokoro-fastapi/.venv/bin:$PATH" \
     UV_LINK_MODE=copy \
     USE_GPU=true \
     DEVICE=gpu
 
 # Install runpod
-RUN /app/.venv/bin/pip install runpod
+RUN /app/kokoro-fastapi/.venv/bin/pip install runpod
 
-# Copy handler
+# Copy handler to app root
+WORKDIR /app
 COPY handler.py ./
 
 # Run the handler
-CMD ["python", "-u", "handler.py"]
+CMD ["python", "-u", "/app/handler.py"]

@@ -9,11 +9,11 @@ import os
 import json
 from typing import Dict, Any, Optional
 
-# Add the api directory to Python path
-sys.path.append('/app')
-sys.path.append('/app/api')
+# Add the Kokoro-FastAPI to Python path
+sys.path.insert(0, '/app/kokoro-fastapi')
+sys.path.insert(0, '/app/kokoro-fastapi/api')
 
-# Import FastAPI app components
+# Import from Kokoro-FastAPI
 from api.src.core.tts import TTSService
 from api.src.core.models import ModelManager
 from api.src.core.config import settings
