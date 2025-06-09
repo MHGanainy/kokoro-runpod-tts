@@ -25,8 +25,7 @@ COPY requirements.txt .
 
 # Install Python packages with optimizations
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir torch-audio-encoders
+    pip install --no-cache-dir -r requirements.txt
 
 # Copy optimized handler
 COPY handler.py .
