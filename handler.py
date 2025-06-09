@@ -1,156 +1,98 @@
 import runpod
-import subprocess
-import time
-import requests
-import json
+import torch
 import base64
-from typing import Dict, Any, Generator
-import os
+import io
+import soundfile as sf
 import sys
+import os
 
-# Add the venv to path
-sys.path.insert(0, '/app/.venv/lib/python3.10/site-packages')
+# Add Kokoro to path
+sys.path.append('/app/kokoro/api/src')
 
-# Start the Kokoro FastAPI server
-def start_kokoro_server():
-    """Start the Kokoro FastAPI server in the background"""
-    env = os.environ.copy()
-    env['DEVICE'] = 'cuda'
-    env['HOST'] = '0.0.0.0'
-    env['PORT'] = '8880'
-    env['PATH'] = '/app/.venv/bin:' + env.get('PATH', '')
-    
-    # Start the server using the GPU start script with the virtual environment
-    cmd = ['/bin/bash', '-c', 'source /app/.venv/bin/activate && cd /app && ./start-gpu.sh']
-    subprocess.Popen(cmd, env=env)
-    
-    # Wait for the server to be ready
-    max_retries = 60  # Increased for model loading time
-    for i in range(max_retries):
-        try:
-            response = requests.get('http://localhost:8880/health', timeout=2)
-            if response.status_code == 200:
-                print("Kokoro server is ready!")
-                return True
-        except:
-            pass
-        if i % 10 == 0:
-            print(f"Waiting for server to start... ({i}/{max_retries})")
-        time.sleep(2)
-    
-    raise Exception("Failed to start Kokoro server")
+# Import what we need from Kokoro
+from models import Models
 
-def handler(job: Dict[str, Any]) -> Generator[Dict[str, Any], None, None]:
+# Global model
+model = None
+
+def init_model():
+    """Initialize the model once"""
+    global model
+    if model is None:
+        print("Loading Kokoro model...")
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"Using device: {device}")
+        
+        model = Models(
+            device=device,
+            model_path="/models/kokoro/kokoro-v1_0.pt"
+        )
+        print("Model loaded!")
+    return model
+
+def handler(job):
     """
-    RunPod handler for Kokoro TTS
+    Simple handler that converts text to speech
     
-    Expected input format:
+    Input:
     {
         "input": {
-            "text": "Hello world!",
-            "voice": "af_bella",  # or voice combinations like "af_bella+af_sky"
-            "model": "kokoro",
-            "response_format": "mp3",  # mp3, wav, opus, flac, pcm
-            "speed": 1.0,
-            "stream": true,  # Enable streaming
-            "include_timestamps": false  # Optional: include word-level timestamps
+            "text": "Hello world",
+            "voice": "af_bella"  # optional, defaults to af_bella
         }
     }
-    """
     
+    Output:
+    {
+        "audio_base64": "...",  # WAV audio encoded in base64
+    }
+    """
     try:
-        job_input = job['input']
-        
-        # Extract parameters
-        text = job_input.get('text', '')
-        voice = job_input.get('voice', 'af_bella')
-        model = job_input.get('model', 'kokoro')
-        response_format = job_input.get('response_format', 'mp3')
-        speed = job_input.get('speed', 1.0)
-        stream = job_input.get('stream', True)
-        include_timestamps = job_input.get('include_timestamps', False)
+        # Get inputs
+        text = job['input'].get('text', '')
+        voice = job['input'].get('voice', 'af_bella')
         
         if not text:
-            yield {"error": "No text provided"}
-            return
+            return {"error": "No text provided"}
         
-        # Prepare request payload
-        payload = {
-            "model": model,
-            "input": text,
-            "voice": voice,
-            "response_format": response_format,
-            "speed": speed,
-            "stream": stream
+        # Initialize model
+        model = init_model()
+        
+        # Load voice
+        voice_path = f"/models/kokoro/voices/{voice}.pt"
+        if not os.path.exists(voice_path):
+            voice_path = "/models/kokoro/voices/af_bella.pt"  # fallback
+        
+        # Generate speech
+        print(f"Generating: {text[:50]}...")
+        with torch.no_grad():
+            audio, _ = model.synthesize(
+                text=text,
+                voicepack=voice_path,
+                speed=1.0
+            )
+        
+        # Convert to WAV bytes
+        buffer = io.BytesIO()
+        sf.write(buffer, audio, 24000, format='WAV')
+        buffer.seek(0)
+        audio_bytes = buffer.read()
+        
+        # Return base64 encoded audio
+        return {
+            "audio_base64": base64.b64encode(audio_bytes).decode('utf-8'),
+            "sample_rate": 24000,
+            "format": "wav"
         }
         
-        # Choose endpoint based on whether timestamps are needed
-        if include_timestamps:
-            endpoint = "http://localhost:8880/dev/captioned_speech"
-        else:
-            endpoint = "http://localhost:8880/v1/audio/speech"
-        
-        # Make request to Kokoro API
-        response = requests.post(
-            endpoint,
-            json=payload,
-            stream=stream
-        )
-        
-        if response.status_code != 200:
-            yield {"error": f"API error: {response.text}"}
-            return
-        
-        if stream:
-            # Handle streaming response
-            if include_timestamps:
-                # Stream with timestamps
-                for line in response.iter_lines(decode_unicode=True):
-                    if line:
-                        chunk_data = json.loads(line)
-                        yield {
-                            "audio_chunk": chunk_data["audio"],  # Base64 encoded
-                            "timestamps": chunk_data.get("timestamps", []),
-                            "is_final": False
-                        }
-            else:
-                # Stream raw audio chunks
-                chunk_buffer = b""
-                for chunk in response.iter_content(chunk_size=4096):
-                    if chunk:
-                        chunk_buffer += chunk
-                        # Send chunks in base64 for easier transport
-                        yield {
-                            "audio_chunk": base64.b64encode(chunk).decode('utf-8'),
-                            "is_final": False
-                        }
-            
-            # Final message
-            yield {"is_final": True}
-        else:
-            # Non-streaming response
-            if include_timestamps:
-                result = response.json()
-                yield {
-                    "audio": result["audio"],  # Base64 encoded
-                    "timestamps": result.get("timestamps", []),
-                    "is_final": True
-                }
-            else:
-                # Return entire audio as base64
-                audio_data = response.content
-                yield {
-                    "audio": base64.b64encode(audio_data).decode('utf-8'),
-                    "response_format": response_format,
-                    "is_final": True
-                }
-                
     except Exception as e:
-        yield {"error": str(e)}
+        print(f"Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
 
-# Initialize server on cold start
-print("Starting Kokoro server...")
-start_kokoro_server()
+# Initialize on startup
+init_model()
 
-# RunPod handler
+# Start RunPod serverless
 runpod.serverless.start({"handler": handler})
