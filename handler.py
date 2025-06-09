@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Kokoro TTS RunPod Serverless Handler
-Optimized for minimum latency and cost
-Compatible with Pipecat ElevenLabs service
+Kokoro TTS RunPod Handler with ElevenLabs WebSocket Compatibility
+Supports:
+1. RunPod REST API with streaming
+2. ElevenLabs-compatible WebSocket server for Pipecat
 """
 
 import asyncio
@@ -10,10 +11,13 @@ import json
 import base64
 import time
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, Generator, Any, Optional
 import os
 import sys
 import logging
+import threading
+from dataclasses import dataclass
+from collections import defaultdict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -39,6 +43,21 @@ except ImportError:
 # Global pipelines - loaded once at container start
 PIPELINES = {}
 LOAD_START_TIME = time.time()
+
+@dataclass
+class AudioContext:
+    """Tracks audio generation context"""
+    context_id: str
+    text_buffer: str = ""
+    audio_chunks: list = None
+    word_times: list = None
+    cumulative_time: float = 0.0
+    
+    def __post_init__(self):
+        if self.audio_chunks is None:
+            self.audio_chunks = []
+        if self.word_times is None:
+            self.word_times = []
 
 def initialize_pipelines():
     """Pre-load all language models for instant access"""
@@ -72,7 +91,7 @@ def initialize_pipelines():
 # Initialize pipelines on import
 initialize_pipelines()
 
-# Create FastAPI app
+# Create FastAPI app for WebSocket server
 app = FastAPI(title="Kokoro TTS WebSocket Server")
 
 # Add CORS middleware
@@ -84,19 +103,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Metrics tracking
-class Metrics:
-    def __init__(self):
-        self.requests = 0
-        self.total_time = 0
-        self.total_characters = 0
+def calculate_word_times(text: str, audio_duration: float, cumulative_time: float = 0) -> list:
+    """Calculate word timestamps based on text and audio duration"""
+    words = text.split()
+    if not words:
+        return []
     
-    def add_request(self, duration: float, characters: int):
-        self.requests += 1
-        self.total_time += duration
-        self.total_characters += characters
+    # Simple linear distribution of words across audio duration
+    word_duration = audio_duration / len(words)
+    word_times = []
+    
+    for i, word in enumerate(words):
+        timestamp = cumulative_time + (i * word_duration)
+        word_times.append((word, timestamp))
+    
+    return word_times
 
-metrics = Metrics()
+def create_alignment_data(text: str, audio_duration_ms: float) -> dict:
+    """Create ElevenLabs-compatible alignment data"""
+    chars = list(text)
+    if not chars:
+        return {"chars": [], "charStartTimesMs": [], "charsDurationsMs": []}
+    
+    char_duration_ms = audio_duration_ms / len(chars) if chars else 0
+    
+    return {
+        "chars": chars,
+        "charStartTimesMs": [int(i * char_duration_ms) for i in range(len(chars))],
+        "charsDurationsMs": [int(char_duration_ms) for _ in chars]
+    }
 
 @app.get("/")
 async def root():
@@ -104,223 +139,168 @@ async def root():
     return {
         "status": "ready",
         "models_loaded": list(PIPELINES.keys()),
-        "load_time": f"{time.time() - LOAD_START_TIME:.2f}s"
+        "load_time": f"{time.time() - LOAD_START_TIME:.2f}s",
+        "mode": "elevenlabs-compatible"
     }
 
-@app.get("/metrics")
-async def get_metrics():
-    """Get usage metrics"""
-    if metrics.requests > 0:
-        return {
-            "requests": metrics.requests,
-            "total_characters": metrics.total_characters,
-            "avg_request_time": metrics.total_time / metrics.requests,
-            "total_compute_seconds": metrics.total_time,
-            "estimated_cost": f"${metrics.total_time * 0.0003:.4f}"
-        }
-    return {"requests": 0}
-
-async def handle_websocket_connection(
+@app.websocket("/v1/text-to-speech/{voice_id}/multi-stream-input")
+async def websocket_elevenlabs_compatible(
     websocket: WebSocket,
     voice_id: str,
-    model_id: str = "kokoro_v1",
+    model_id: str = "eleven_flash_v2_5",
     output_format: str = "pcm_16000",
     language_code: Optional[str] = None,
-    optimize_streaming_latency: Optional[int] = 3,
-    inactivity_timeout: Optional[int] = 60,
+    auto_mode: str = "true",
+    enable_ssml_parsing: Optional[bool] = None,
+    enable_logging: Optional[bool] = None,
 ):
-    """
-    Core WebSocket handler logic - ElevenLabs compatible
-    """
+    """ElevenLabs-compatible WebSocket endpoint for Pipecat"""
     await websocket.accept()
-    logger.info(f"WebSocket connected: voice={voice_id}, format={output_format}")
     
-    request_start = time.time()
-    total_characters = 0
+    logger.info(f"ElevenLabs-compatible WebSocket connected: voice={voice_id}, model={model_id}")
+    
+    # Track contexts for this connection
+    contexts: Dict[str, AudioContext] = {}
+    active_context_id: Optional[str] = None
     
     try:
-        # Determine language
-        lang_code = language_code or (voice_id[0] if voice_id else 'a')
-        pipeline = PIPELINES.get(lang_code, PIPELINES['a'])
-        
-        # Connection timeout handling
-        last_activity = time.time()
-        
         while True:
-            try:
-                # Add timeout to prevent hanging connections
-                message = await asyncio.wait_for(
-                    websocket.receive_text(),
-                    timeout=inactivity_timeout
-                )
-                last_activity = time.time()
-                
-            except asyncio.TimeoutError:
-                logger.info("WebSocket timeout - closing connection")
-                break
+            # Receive message
+            message = await websocket.receive_text()
             
-            # Parse message
             try:
                 data = json.loads(message)
             except json.JSONDecodeError:
+                # Handle keepalive empty messages
                 continue
             
-            # Handle control messages
-            if not data or data.get("close_socket"):
-                break
-            
-            # Handle keepalive (empty message)
+            # Handle different message types
             if not data:
+                # Keepalive message
                 continue
-            
-            # Handle context close
+                
+            if data.get("close_socket"):
+                logger.info("Close socket requested")
+                break
+                
             if data.get("close_context"):
-                # Just acknowledge, we don't maintain persistent contexts
-                logger.debug(f"Context close requested: {data.get('context_id')}")
+                context_id = data.get("context_id")
+                if context_id in contexts:
+                    logger.info(f"Closing context {context_id}")
+                    del contexts[context_id]
+                    if active_context_id == context_id:
+                        active_context_id = None
                 continue
             
-            # Check for text to process
+            # Handle text generation
             text = data.get("text", "").strip()
-            if not text:
+            context_id = data.get("context_id")
+            
+            if not context_id:
+                logger.warning("No context_id provided, skipping")
+                continue
+                
+            # Handle initial space for new context
+            if text == " " and context_id not in contexts:
+                # Initialize new context
+                contexts[context_id] = AudioContext(context_id=context_id)
+                active_context_id = context_id
+                logger.info(f"Initialized new context {context_id}")
                 continue
             
-            # Handle both snake_case and camelCase for compatibility
-            context_id = data.get("context_id") or data.get("contextId", "default")
-            
-            # Special handling for ElevenLabs initial space
-            if text == " " and not total_characters:
-                # This is the ElevenLabs initialization message, skip processing
-                logger.debug("Skipping ElevenLabs initialization space")
+            if not text or text == " ":
                 continue
+                
+            # Get or create context
+            if context_id not in contexts:
+                contexts[context_id] = AudioContext(context_id=context_id)
             
-            if text:
-                total_characters += len(text)
-                generation_start = time.time()
+            context = contexts[context_id]
+            context.text_buffer = text
+            
+            # Get voice settings if provided
+            voice_settings = data.get("voice_settings", {})
+            speed = voice_settings.get("speed", 1.0)
+            
+            # Determine language/pipeline
+            lang_code = voice_id[0] if voice_id and voice_id[0] in PIPELINES else 'a'
+            pipeline = PIPELINES.get(lang_code, PIPELINES['a'])
+            
+            logger.info(f"Generating audio for context {context_id}: '{text}'")
+            
+            # Generate audio
+            generation_start = time.time()
+            audio_chunks = []
+            total_samples = 0
+            
+            try:
+                for graphemes, phonemes, audio in pipeline(text, voice=voice_id, speed=speed):
+                    # Convert to PCM16
+                    audio_pcm = (audio * 32767).astype(np.int16)
+                    audio_bytes = audio_pcm.tobytes()
+                    audio_chunks.append(audio)
+                    total_samples += len(audio)
+                    
+                    # Send audio chunk immediately
+                    chunk_message = {
+                        "audio": base64.b64encode(audio_bytes).decode('utf-8'),
+                        "contextId": context_id,
+                        "isFinal": False
+                    }
+                    await websocket.send_text(json.dumps(chunk_message))
                 
-                # Voice settings
-                voice_settings = data.get("voice_settings", {})
-                speed = voice_settings.get("speed", 1.0)
-                
-                try:
-                    # Generate audio
-                    chunk_count = 0
-                    first_chunk_time = None
-                    audio_chunks = []
+                # Calculate audio duration and create alignment
+                if audio_chunks:
+                    full_audio = np.concatenate(audio_chunks)
+                    audio_duration = len(full_audio) / 24000.0  # 24kHz sample rate
+                    audio_duration_ms = audio_duration * 1000
                     
-                    for i, (graphemes, phonemes, audio) in enumerate(
-                        pipeline(text, voice=voice_id, speed=speed)
-                    ):
-                        if first_chunk_time is None:
-                            first_chunk_time = time.time() - generation_start
-                        
-                        # Convert to PCM16
-                        audio_pcm = (audio * 32767).astype(np.int16)
-                        audio_bytes = audio_pcm.tobytes()
-                        
-                        # Send chunk immediately for streaming
-                        await websocket.send_text(json.dumps({
-                            "audio": base64.b64encode(audio_bytes).decode('utf-8'),
-                            "contextId": context_id,  # Use camelCase for Pipecat compatibility
-                            "isFinal": False
-                        }))
-                        
-                        chunk_count += 1
-                        audio_chunks.append(audio)
-                    
-                    # Optional: Send alignment data for word timestamps
-                    # This is a simplified version - you could implement proper word timing
-                    if chunk_count > 0:
-                        words = text.split()
-                        total_duration = len(np.concatenate(audio_chunks)) / 24000.0  # seconds
-                        chars = list(text)
-                        char_duration_ms = (total_duration * 1000) / len(chars) if chars else 0
-                        
-                        alignment = {
-                            "chars": chars,
-                            "charStartTimesMs": [int(i * char_duration_ms) for i in range(len(chars))],
-                            "charsDurationsMs": [int(char_duration_ms) for _ in chars]
-                        }
-                        
-                        await websocket.send_text(json.dumps({
-                            "alignment": alignment,
-                            "contextId": context_id
-                        }))
-                    
-                    # Send final message
-                    generation_time = time.time() - generation_start
-                    await websocket.send_text(json.dumps({
-                        "isFinal": True,
-                        "contextId": context_id,  # Use camelCase for Pipecat compatibility
-                        "metadata": {
-                            "chunks": chunk_count,
-                            "characters": len(text),
-                            "generation_time_ms": int(generation_time * 1000),
-                            "first_chunk_ms": int(first_chunk_time * 1000) if first_chunk_time else None
-                        }
-                    }))
-                    
-                    logger.info(f"Generated {len(text)} chars in {generation_time:.2f}s")
-                    
-                except Exception as e:
-                    logger.error(f"Generation error: {e}")
-                    await websocket.send_text(json.dumps({
-                        "error": str(e),
+                    # Send alignment data
+                    alignment = create_alignment_data(text, audio_duration_ms)
+                    alignment_message = {
+                        "alignment": alignment,
                         "contextId": context_id
-                    }))
+                    }
+                    await websocket.send_text(json.dumps(alignment_message))
+                    
+                    # Update context cumulative time
+                    context.cumulative_time += audio_duration
+                
+                # Send final message
+                generation_time = time.time() - generation_start
+                final_message = {
+                    "isFinal": True,
+                    "contextId": context_id,
+                    "metadata": {
+                        "chunks": len(audio_chunks),
+                        "characters": len(text),
+                        "generation_time_ms": int(generation_time * 1000),
+                        "audio_duration_ms": int(audio_duration_ms) if audio_chunks else 0
+                    }
+                }
+                await websocket.send_text(json.dumps(final_message))
+                
+                logger.info(f"Completed generation for context {context_id} in {generation_time:.2f}s")
+                
+            except Exception as e:
+                logger.error(f"Error generating audio: {e}")
+                error_message = {
+                    "error": str(e),
+                    "contextId": context_id
+                }
+                await websocket.send_text(json.dumps(error_message))
     
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected by client")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
-        # Record metrics
-        request_duration = time.time() - request_start
-        metrics.add_request(request_duration, total_characters)
-        logger.info(f"Session ended: {request_duration:.2f}s, {total_characters} chars")
+        logger.info(f"WebSocket connection closed. Had {len(contexts)} contexts.")
 
-# Main WebSocket endpoint - ElevenLabs compatible path
-@app.websocket("/v1/text-to-speech/{voice_id}/stream-input")
-async def websocket_stream_input(
-    websocket: WebSocket,
-    voice_id: str,
-    model_id: str = "kokoro_v1",
-    output_format: str = "pcm_16000",
-    language_code: Optional[str] = None,
-    optimize_streaming_latency: Optional[int] = 3,
-    inactivity_timeout: Optional[int] = 60,
-    # Add any other specific parameters ElevenLabs might send
-    auto_mode: Optional[str] = None,
-    enable_ssml_parsing: Optional[bool] = None,
-    enable_logging: Optional[bool] = None
-):
-    """ElevenLabs-compatible WebSocket endpoint (stream-input)"""
-    await handle_websocket_connection(
-        websocket, voice_id, model_id, output_format, 
-        language_code, optimize_streaming_latency, inactivity_timeout
-    )
-
-# Alternative endpoint path for backward compatibility
-@app.websocket("/v1/text-to-speech/{voice_id}/multi-stream-input")
-async def websocket_multi_stream_input(
-    websocket: WebSocket,
-    voice_id: str,
-    model_id: str = "kokoro_v1",
-    output_format: str = "pcm_16000",
-    language_code: Optional[str] = None,
-    optimize_streaming_latency: Optional[int] = 3,
-    inactivity_timeout: Optional[int] = 60,
-):
-    """Alternative WebSocket endpoint (multi-stream-input)"""
-    await handle_websocket_connection(
-        websocket, voice_id, model_id, output_format, 
-        language_code, optimize_streaming_latency, inactivity_timeout
-    )
-
-# RunPod Handler for REST API
-def runpod_handler(job):
+# RunPod streaming handler
+def generator_handler(job: Dict[str, Any]) -> Generator[Dict[str, Any], None, None]:
     """
-    RunPod serverless handler
-    Optimized for batch processing
+    Generator handler for streaming TTS output via RunPod
     """
     job_start = time.time()
     
@@ -330,57 +310,96 @@ def runpod_handler(job):
         voice_id = job_input.get("voice_id", "af_bella")
         speed = job_input.get("speed", 1.0)
         output_format = job_input.get("output_format", "pcm_16000")
+        streaming = job_input.get("streaming", True)
         
         if not text:
-            return {"error": "No text provided"}
+            yield {"error": "No text provided"}
+            return
         
         # Get pipeline
         lang_code = voice_id[0] if voice_id else 'a'
         pipeline = PIPELINES.get(lang_code, PIPELINES['a'])
         
-        # Generate audio
-        audio_chunks = []
-        for _, _, audio in pipeline(text, voice=voice_id, speed=speed):
-            audio_chunks.append(audio)
-        
-        # Combine audio
-        full_audio = np.concatenate(audio_chunks)
-        
-        # Encode based on format
-        if "pcm" in output_format:
-            audio_data = (full_audio * 32767).astype(np.int16).tobytes()
-        else:
-            # Default to WAV
-            import io
-            import soundfile as sf
-            buffer = io.BytesIO()
-            sf.write(buffer, full_audio, 24000, format='wav')
-            audio_data = buffer.getvalue()
-        
-        # Return result
-        processing_time = time.time() - job_start
-        
-        return {
-            "audio": base64.b64encode(audio_data).decode('utf-8'),
-            "format": output_format,
-            "sample_rate": 24000,
-            "processing_time": processing_time,
-            "characters": len(text)
+        # Send initial status
+        yield {
+            "status": "started",
+            "text_info": {
+                "text": text,
+                "voice_id": voice_id,
+                "characters": len(text),
+            }
         }
         
+        # Generate audio with streaming
+        audio_chunks = []
+        chunk_count = 0
+        total_samples = 0
+        first_chunk_time = None
+        
+        for graphemes, phonemes, audio in pipeline(text, voice=voice_id, speed=speed):
+            if first_chunk_time is None:
+                first_chunk_time = time.time() - job_start
+            
+            # Convert to PCM16
+            audio_pcm = (audio * 32767).astype(np.int16)
+            audio_bytes = audio_pcm.tobytes()
+            audio_chunks.append(audio)
+            
+            chunk_count += 1
+            total_samples += len(audio)
+            
+            # Stream each chunk
+            if streaming:
+                yield {
+                    "audio_chunk": base64.b64encode(audio_bytes).decode('utf-8'),
+                    "chunk_number": chunk_count,
+                    "chunk_samples": len(audio),
+                    "total_samples": total_samples,
+                    "sample_rate": 24000,
+                    "format": output_format,
+                    "timestamp": time.time() - job_start
+                }
+        
+        # Final result
+        if audio_chunks:
+            full_audio = np.concatenate(audio_chunks)
+            audio_duration = len(full_audio) / 24000.0
+            
+            # Encode full audio
+            if "pcm" in output_format:
+                full_audio_data = (full_audio * 32767).astype(np.int16).tobytes()
+            else:
+                import io
+                import soundfile as sf
+                buffer = io.BytesIO()
+                sf.write(buffer, full_audio, 24000, format='wav')
+                full_audio_data = buffer.getvalue()
+            
+            processing_time = time.time() - job_start
+            
+            yield {
+                "status": "completed",
+                "audio": base64.b64encode(full_audio_data).decode('utf-8'),
+                "format": output_format,
+                "sample_rate": 24000,
+                "total_chunks": chunk_count,
+                "audio_duration": audio_duration,
+                "processing_time": processing_time,
+                "first_chunk_latency": first_chunk_time,
+                "characters": len(text),
+                "real_time_factor": processing_time / audio_duration if audio_duration > 0 else 0
+            }
+        
     except Exception as e:
-        logger.error(f"RunPod handler error: {e}")
-        return {"error": str(e)}
+        logger.error(f"Generator handler error: {e}")
+        yield {"error": str(e), "status": "failed"}
 
-# Start both servers
+# Start servers based on environment
 if __name__ == "__main__":
-    # Check if running in RunPod
     if os.environ.get("RUNPOD_POD_ID"):
-        logger.info("Starting in RunPod mode")
+        logger.info("Starting in RunPod mode with WebSocket server")
         
-        # Start WebSocket server in background
-        import threading
-        
+        # Start WebSocket server in background thread
         def run_websocket_server():
             uvicorn.run(
                 app,
@@ -392,11 +411,14 @@ if __name__ == "__main__":
         
         websocket_thread = threading.Thread(target=run_websocket_server, daemon=True)
         websocket_thread.start()
-        logger.info("WebSocket server started on port 8000")
+        logger.info("ElevenLabs-compatible WebSocket server started on port 8000")
         
         # Start RunPod handler
-        runpod.serverless.start({"handler": runpod_handler})
+        runpod.serverless.start({
+            "handler": generator_handler,
+            "return_aggregate_stream": True
+        })
     else:
-        # Local testing mode
-        logger.info("Starting in local mode")
+        # Local testing mode - just run WebSocket server
+        logger.info("Starting in local mode (WebSocket only)")
         uvicorn.run(app, host="0.0.0.0", port=8000)
