@@ -41,7 +41,6 @@ RUN uv venv --python 3.10 && \
 
 # Copy project files
 COPY api ./api
-COPY web ./web
 
 # Download the model
 COPY download_model.py ./
