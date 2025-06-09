@@ -1,98 +1,128 @@
+"""
+Runpod Serverless Handler for Kokoro TTS
+"""
 import runpod
-import torch
-import base64
 import io
-import soundfile as sf
+import base64
 import sys
 import os
+import json
+from typing import Dict, Any, Optional
 
-# Add Kokoro to path
-sys.path.append('/app/kokoro/api/src')
+# Add the api directory to Python path
+sys.path.append('/app')
+sys.path.append('/app/api')
 
-# Import what we need from Kokoro
-from models import Models
+# Import FastAPI app components
+from api.src.core.tts import TTSService
+from api.src.core.models import ModelManager
+from api.src.core.config import settings
+from api.src.routers.v1.audio.speech import SpeechRequest, ResponseFormat
 
-# Global model
-model = None
+# Initialize services globally
+model_manager = None
+tts_service = None
 
-def init_model():
-    """Initialize the model once"""
-    global model
-    if model is None:
-        print("Loading Kokoro model...")
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        print(f"Using device: {device}")
-        
-        model = Models(
-            device=device,
-            model_path="/models/kokoro/kokoro-v1_0.pt"
-        )
-        print("Model loaded!")
-    return model
 
-def handler(job):
-    """
-    Simple handler that converts text to speech
+def init_services():
+    """Initialize the TTS services"""
+    global model_manager, tts_service
     
-    Input:
+    print("Initializing Kokoro TTS services...")
+    
+    # Initialize model manager
+    model_manager = ModelManager()
+    
+    # Initialize TTS service
+    tts_service = TTSService(model_manager)
+    
+    print("Services initialized successfully!")
+
+
+def handler(event: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Runpod handler function
+    
+    Expected input format:
     {
         "input": {
-            "text": "Hello world",
-            "voice": "af_bella"  # optional, defaults to af_bella
+            "text": "Hello world!",
+            "voice": "af_bella",  # or voice combinations like "af_sky+af_bella"
+            "response_format": "mp3",  # mp3, wav, flac, pcm, etc.
+            "speed": 1.0,  # optional, default 1.0
+            "stream": false  # for now, we'll return complete audio
         }
-    }
-    
-    Output:
-    {
-        "audio_base64": "...",  # WAV audio encoded in base64
     }
     """
     try:
-        # Get inputs
-        text = job['input'].get('text', '')
-        voice = job['input'].get('voice', 'af_bella')
+        # Get input from event
+        job_input = event.get("input", {})
+        
+        # Extract parameters
+        text = job_input.get("text", job_input.get("input", ""))
+        voice = job_input.get("voice", "af_bella")
+        response_format = job_input.get("response_format", "mp3")
+        speed = job_input.get("speed", 1.0)
         
         if not text:
-            return {"error": "No text provided"}
+            return {
+                "error": "No text provided"
+            }
         
-        # Initialize model
-        model = init_model()
+        print(f"Processing TTS request: text='{text[:50]}...', voice={voice}, format={response_format}")
         
-        # Load voice
-        voice_path = f"/models/kokoro/voices/{voice}.pt"
-        if not os.path.exists(voice_path):
-            voice_path = "/models/kokoro/voices/af_bella.pt"  # fallback
+        # Create speech request
+        speech_request = SpeechRequest(
+            input=text,
+            voice=voice,
+            response_format=ResponseFormat(response_format),
+            speed=speed
+        )
         
-        # Generate speech
-        print(f"Generating: {text[:50]}...")
-        with torch.no_grad():
-            audio, _ = model.synthesize(
-                text=text,
-                voicepack=voice_path,
-                speed=1.0
-            )
+        # Generate audio
+        audio_generator = tts_service.generate_speech_streaming(
+            text=speech_request.input,
+            voice=speech_request.voice,
+            speed=speech_request.speed,
+            response_format=speech_request.response_format
+        )
         
-        # Convert to WAV bytes
-        buffer = io.BytesIO()
-        sf.write(buffer, audio, 24000, format='WAV')
-        buffer.seek(0)
-        audio_bytes = buffer.read()
+        # Collect all audio chunks
+        audio_chunks = []
+        for chunk in audio_generator:
+            audio_chunks.append(chunk)
         
-        # Return base64 encoded audio
+        # Combine chunks
+        audio_data = b''.join(audio_chunks)
+        
+        # Encode audio data as base64
+        audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+        
+        print(f"Generated audio: {len(audio_data)} bytes")
+        
         return {
-            "audio_base64": base64.b64encode(audio_bytes).decode('utf-8'),
-            "sample_rate": 24000,
-            "format": "wav"
+            "audio_base64": audio_base64,
+            "format": response_format,
+            "voice": voice,
+            "text_length": len(text),
+            "audio_size_bytes": len(audio_data)
         }
         
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Error in handler: {str(e)}")
         import traceback
         traceback.print_exc()
-        return {"error": str(e)}
+        
+        return {
+            "error": str(e)
+        }
 
-# Initialize on startup
-init_model()
 
-# Start RunPod serverless
-runpod.serverless.start({"handler": handler})
+if __name__ == "__main__":
+    # Initialize services on startup
+    init_services()
+    
+    # Start the Runpod serverless handler
+    runpod.serverless.start({
+        "handler": handler
+    })
