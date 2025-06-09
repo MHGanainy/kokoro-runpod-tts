@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Safe Optimized GPU Handler - Performance improvements without dtype issues
+Fixed Safe Optimized GPU Handler - Corrected voice caching issue
 """
 
 import runpod
@@ -308,7 +308,7 @@ def generate_safe_audio(
     job_start: float,
     message_index: Optional[int] = None
 ) -> Generator[Dict[str, Any], None, float]:
-    """Generate audio with safe optimizations"""
+    """Generate audio with safe optimizations - FIXED VERSION"""
     
     # Select pipeline
     lang_code = voice_id[0] if voice_id and voice_id[0] in PIPELINES else 'a'
@@ -324,13 +324,21 @@ def generate_safe_audio(
     gpu_memory_before = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
     
     try:
-        # Get cached voice for faster loading
-        voice_tensor = get_cached_voice(voice_id, pipeline)
+        # FIXED: Use voice_id string directly, not cached tensor
+        # The pipeline expects a voice name string, not a tensor
+        # The caching should happen inside the pipeline
+        
+        # Check if voice is already cached in the pipeline
+        if voice_id not in pipeline.voices:
+            # Load voice if not in pipeline cache
+            print(f"Loading voice {voice_id} into pipeline cache...")
+            voice_tensor = pipeline.load_voice(voice_id)
+            # Pipeline already handles moving to device
         
         # Use autocast for performance while maintaining compatibility
         with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()) if torch.cuda.is_available() else torch.no_grad():
-            # Generate with optimizations
-            for result in pipeline(text, voice=voice_tensor, speed=speed):
+            # Generate with optimizations - use voice_id string, not tensor
+            for result in pipeline(text, voice=voice_id, speed=speed):
                 if first_chunk_time is None:
                     first_chunk_time = time.perf_counter() - job_start
                     
@@ -394,11 +402,30 @@ def generate_safe_audio(
             }
             
             return audio_duration
+        else:
+            # No audio generated - this is the problem!
+            yield {
+                "error": f"No audio generated for text: '{text}' with voice: '{voice_id}'",
+                "contextId": context_id,
+                "debug": {
+                    "text_length": len(text),
+                    "voice_id": voice_id,
+                    "pipeline_lang": lang_code,
+                    "generation_time_ms": int((time.perf_counter() - generation_start) * 1000)
+                }
+            }
+            return 0.0
         
-        return 0.0
-            
     except Exception as e:
-        yield {"error": str(e), "contextId": context_id}
+        yield {
+            "error": f"Audio generation failed: {str(e)}",
+            "contextId": context_id,
+            "debug": {
+                "text": text,
+                "voice_id": voice_id,
+                "exception_type": type(e).__name__
+            }
+        }
         return 0.0
     finally:
         # Smart memory cleanup
@@ -412,4 +439,4 @@ safe_force_gpu_usage()
 runpod.serverless.start({
     "handler": safe_optimized_handler,
     "return_aggregate_stream": True
-}) 
+})
