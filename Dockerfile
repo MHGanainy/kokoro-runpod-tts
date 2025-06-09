@@ -53,12 +53,12 @@ ENV PYTHONUNBUFFERED=1 \
     USE_GPU=true \
     DEVICE=gpu
 
-# Install runpod
-RUN /app/kokoro-fastapi/.venv/bin/pip install runpod
-
 # Copy handler to app root
 WORKDIR /app
 COPY handler.py ./
+COPY requirements.txt ./
+
+RUN uv pip install -r requirements.txt
 
 # Run the handler
-CMD ["python", "-u", "/app/handler.py"]
+CMD ["/app/kokoro-fastapi/.venv/bin/python", "-u", "/app/handler.py"]
