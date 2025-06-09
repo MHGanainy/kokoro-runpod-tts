@@ -6,6 +6,10 @@ import json
 import base64
 from typing import Dict, Any, Generator
 import os
+import sys
+
+# Add the venv to path
+sys.path.insert(0, '/app/.venv/lib/python3.10/site-packages')
 
 # Start the Kokoro FastAPI server
 def start_kokoro_server():
@@ -14,21 +18,25 @@ def start_kokoro_server():
     env['DEVICE'] = 'cuda'
     env['HOST'] = '0.0.0.0'
     env['PORT'] = '8880'
+    env['PATH'] = '/app/.venv/bin:' + env.get('PATH', '')
     
-    # Start the server using the GPU start script
-    subprocess.Popen(['./start-gpu.sh'], env=env)
+    # Start the server using the GPU start script with the virtual environment
+    cmd = ['/bin/bash', '-c', 'source /app/.venv/bin/activate && cd /app && ./start-gpu.sh']
+    subprocess.Popen(cmd, env=env)
     
     # Wait for the server to be ready
-    max_retries = 30
+    max_retries = 60  # Increased for model loading time
     for i in range(max_retries):
         try:
-            response = requests.get('http://localhost:8880/health')
+            response = requests.get('http://localhost:8880/health', timeout=2)
             if response.status_code == 200:
                 print("Kokoro server is ready!")
                 return True
         except:
             pass
-        time.sleep(1)
+        if i % 10 == 0:
+            print(f"Waiting for server to start... ({i}/{max_retries})")
+        time.sleep(2)
     
     raise Exception("Failed to start Kokoro server")
 
