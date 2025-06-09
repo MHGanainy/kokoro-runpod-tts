@@ -20,11 +20,39 @@ jobs:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_TOKEN }}
     
+    - name: Generate unique tag
+      id: tags
+      run: |
+        # Generate timestamp-based tag
+        TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+        
+        # Get short SHA
+        SHORT_SHA=$(echo ${GITHUB_SHA} | cut -c1-7)
+        
+        # Get branch name (replace / with -)
+        BRANCH_NAME=$(echo ${GITHUB_REF#refs/heads/} | sed 's/\//-/g')
+        
+        # Create multiple tag variants
+        echo "timestamp=${TIMESTAMP}" >> $GITHUB_OUTPUT
+        echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+        echo "branch=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+        
+        # Combined tags
+        echo "version=${BRANCH_NAME}-${TIMESTAMP}-${SHORT_SHA}" >> $GITHUB_OUTPUT
+        echo "simple=${TIMESTAMP}-${SHORT_SHA}" >> $GITHUB_OUTPUT
+        echo "date=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+    
     - name: Build and push
       uses: docker/build-push-action@v4
       with:
         context: .
         push: true
-        tags: ${{ secrets.DOCKER_USERNAME }}/kokoro-tts:latest
+        tags: |
+          ${{ secrets.DOCKER_USERNAME }}/kokoro-tts:latest
+          ${{ secrets.DOCKER_USERNAME }}/kokoro-tts:${{ steps.tags.outputs.version }}
+          ${{ secrets.DOCKER_USERNAME }}/kokoro-tts:${{ steps.tags.outputs.simple }}
+          ${{ secrets.DOCKER_USERNAME }}/kokoro-tts:build-${{ github.run_number }}
+          ${{ secrets.DOCKER_USERNAME }}/kokoro-tts:sha-${{ steps.tags.outputs.sha }}
+          ${{ secrets.DOCKER_USERNAME }}/kokoro-tts:${{ steps.tags.outputs.date }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
