@@ -52,10 +52,10 @@ def initialize_optimized_kokoro():
         logger.warning("Loading shared Kokoro model...")
         start = time.perf_counter()
         
-        # Use Kokoro's automatic device selection with explicit GPU preference
-        SHARED_MODEL = KModel(device=DEVICE).eval()
+        # Create shared model (device will be set when moved to GPU)
+        SHARED_MODEL = KModel().eval()
         
-        # GPU memory optimization
+        # Move to GPU and optimize
         if torch.cuda.is_available():
             SHARED_MODEL = SHARED_MODEL.to(DEVICE)
             torch.cuda.empty_cache()
@@ -71,11 +71,11 @@ def initialize_optimized_kokoro():
             try:
                 pipeline_start = time.perf_counter()
                 
-                # Create pipeline with shared model (Kokoro's optimization)
+                # Create pipeline with shared model and explicit device
                 pipeline = KPipeline(
                     lang_code=lang_code,
                     model=SHARED_MODEL,  # Reuse the same model
-                    device=DEVICE
+                    device=DEVICE  # KPipeline handles device parameter
                 )
                 
                 # Pre-load common voices for this language
