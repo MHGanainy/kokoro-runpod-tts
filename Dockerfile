@@ -51,13 +51,14 @@ ENV PHONEMIZER_ESPEAK_PATH=/usr/bin \
     PHONEMIZER_ESPEAK_DATA=/usr/share/espeak-ng-data \
     ESPEAK_DATA_PATH=/usr/share/espeak-ng-data \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app/kokoro-fastapi:/app/kokoro-fastapi/api \
+    PYTHONPATH=/app/kokoro-fastapi:/app/kokoro-fastapi/api:/app \
     USE_GPU=true \
     DEVICE=gpu \
     CUDA_VISIBLE_DEVICES=0
 
-# Copy handler
+# Copy handler and test script
 COPY handler.py .
+COPY test_imports.py .
 
 # Run the handler
 CMD ["python", "-u", "/app/handler.py"]

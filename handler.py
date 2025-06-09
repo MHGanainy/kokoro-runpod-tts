@@ -9,15 +9,48 @@ import os
 import json
 from typing import Dict, Any, Optional
 
-# Add the Kokoro-FastAPI to Python path
-sys.path.insert(0, '/app/kokoro-fastapi')
-sys.path.insert(0, '/app/kokoro-fastapi/api')
+# Setup paths
+KOKORO_PATH = '/app/kokoro-fastapi'
+API_PATH = os.path.join(KOKORO_PATH, 'api')
 
-# Import from Kokoro-FastAPI
-from api.src.core.tts import TTSService
-from api.src.core.models import ModelManager
-from api.src.core.config import settings
-from api.src.routers.v1.audio.speech import SpeechRequest, ResponseFormat
+# Add paths to sys.path
+for path in [KOKORO_PATH, API_PATH]:
+    if os.path.exists(path) and path not in sys.path:
+        sys.path.insert(0, path)
+        print(f"Added to sys.path: {path}")
+
+# Debug info
+print(f"Python path: {sys.path}")
+print(f"Current directory: {os.getcwd()}")
+
+try:
+    # Try different import approaches
+    try:
+        from src.core.tts import TTSService
+        from src.core.models import ModelManager
+        from src.core.config import settings
+        from src.routers.v1.audio.speech import SpeechRequest, ResponseFormat
+        print("Successfully imported from src.*")
+    except ImportError as e:
+        print(f"Failed to import from src.*: {e}")
+        # Try alternative import
+        from api.src.core.tts import TTSService
+        from api.src.core.models import ModelManager
+        from api.src.core.config import settings
+        from api.src.routers.v1.audio.speech import SpeechRequest, ResponseFormat
+        print("Successfully imported from api.src.*")
+except ImportError as e:
+    print(f"Import error: {e}")
+    print("Directory structure:")
+    for root, dirs, files in os.walk('/app'):
+        level = root.replace('/app', '').count(os.sep)
+        indent = ' ' * 2 * level
+        print(f"{indent}{os.path.basename(root)}/")
+        subindent = ' ' * 2 * (level + 1)
+        for file in files[:5]:  # Limit files shown
+            if file.endswith('.py'):
+                print(f"{subindent}{file}")
+    raise
 
 # Initialize services globally
 model_manager = None
@@ -30,13 +63,19 @@ def init_services():
     
     print("Initializing Kokoro TTS services...")
     
-    # Initialize model manager
-    model_manager = ModelManager()
-    
-    # Initialize TTS service
-    tts_service = TTSService(model_manager)
-    
-    print("Services initialized successfully!")
+    try:
+        # Initialize model manager
+        model_manager = ModelManager()
+        
+        # Initialize TTS service
+        tts_service = TTSService(model_manager)
+        
+        print("Services initialized successfully!")
+    except Exception as e:
+        print(f"Error initializing services: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -50,7 +89,6 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             "voice": "af_bella",  # or voice combinations like "af_sky+af_bella"
             "response_format": "mp3",  # mp3, wav, flac, pcm, etc.
             "speed": 1.0,  # optional, default 1.0
-            "stream": false  # for now, we'll return complete audio
         }
     }
     """
@@ -114,15 +152,21 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         traceback.print_exc()
         
         return {
-            "error": str(e)
+            "error": str(e),
+            "traceback": traceback.format_exc()
         }
 
 
 if __name__ == "__main__":
     # Initialize services on startup
-    init_services()
+    try:
+        init_services()
+    except Exception as e:
+        print(f"Failed to initialize services: {e}")
+        sys.exit(1)
     
     # Start the Runpod serverless handler
+    print("Starting Runpod serverless handler...")
     runpod.serverless.start({
         "handler": handler
     })
