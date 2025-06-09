@@ -1,63 +1,32 @@
 #!/usr/bin/env python3
 """
-Kokoro TTS RunPod Handler with ElevenLabs WebSocket Compatibility
-Supports:
-1. RunPod REST API with streaming
-2. ElevenLabs-compatible WebSocket server for Pipecat
+Kokoro TTS RunPod Serverless Handler with WebSocket-Style Streaming
+Provides ElevenLabs-compatible streaming interface using RunPod's streaming API
 """
 
-import asyncio
-import json
+import runpod
 import base64
 import time
 import numpy as np
-from typing import Dict, Generator, Any, Optional
-import os
-import sys
+import json
+import uuid
+from typing import Dict, Generator, Any, Optional, List, Tuple
 import logging
-import threading
-from dataclasses import dataclass
-from collections import defaultdict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Import required libraries
-import torch
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-import runpod
-
-# Force single-threaded for consistent performance
-torch.set_num_threads(1)
 
 # Import Kokoro
 try:
     from kokoro import KPipeline
 except ImportError:
     logger.error("Kokoro not installed. Please install with: pip install kokoro>=0.9.4")
-    sys.exit(1)
+    raise
 
 # Global pipelines - loaded once at container start
 PIPELINES = {}
 LOAD_START_TIME = time.time()
-
-@dataclass
-class AudioContext:
-    """Tracks audio generation context"""
-    context_id: str
-    text_buffer: str = ""
-    audio_chunks: list = None
-    word_times: list = None
-    cumulative_time: float = 0.0
-    
-    def __post_init__(self):
-        if self.audio_chunks is None:
-            self.audio_chunks = []
-        if self.word_times is None:
-            self.word_times = []
 
 def initialize_pipelines():
     """Pre-load all language models for instant access"""
@@ -94,19 +63,21 @@ def initialize_pipelines():
 # Initialize pipelines on import
 initialize_pipelines()
 
-# Create FastAPI app for WebSocket server
-app = FastAPI(title="Kokoro TTS WebSocket Server")
+def create_alignment_data(text: str, audio_duration_ms: float) -> dict:
+    """Create ElevenLabs-compatible alignment data"""
+    chars = list(text)
+    if not chars:
+        return {"chars": [], "charStartTimesMs": [], "charsDurationsMs": []}
+    
+    char_duration_ms = audio_duration_ms / len(chars) if chars else 0
+    
+    return {
+        "chars": chars,
+        "charStartTimesMs": [int(i * char_duration_ms) for i in range(len(chars))],
+        "charsDurationsMs": [int(char_duration_ms) for _ in chars]
+    }
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-def calculate_word_times(text: str, audio_duration: float, cumulative_time: float = 0) -> list:
+def calculate_word_times(text: str, audio_duration: float, cumulative_time: float = 0) -> List[Tuple[str, float]]:
     """Calculate word timestamps based on text and audio duration"""
     words = text.split()
     if not words:
@@ -122,235 +93,238 @@ def calculate_word_times(text: str, audio_duration: float, cumulative_time: floa
     
     return word_times
 
-def create_alignment_data(text: str, audio_duration_ms: float) -> dict:
-    """Create ElevenLabs-compatible alignment data"""
-    chars = list(text)
-    if not chars:
-        return {"chars": [], "charStartTimesMs": [], "charsDurationsMs": []}
-    
-    char_duration_ms = audio_duration_ms / len(chars) if chars else 0
-    
-    return {
-        "chars": chars,
-        "charStartTimesMs": [int(i * char_duration_ms) for i in range(len(chars))],
-        "charsDurationsMs": [int(char_duration_ms) for _ in chars]
-    }
-
-@app.get("/")
-async def root():
-    """Health check endpoint"""
-    return {
-        "status": "ready",
-        "models_loaded": list(PIPELINES.keys()),
-        "load_time": f"{time.time() - LOAD_START_TIME:.2f}s",
-        "mode": "elevenlabs-compatible"
-    }
-
-@app.websocket("/v1/text-to-speech/{voice_id}/multi-stream-input")
-async def websocket_elevenlabs_compatible(
-    websocket: WebSocket,
-    voice_id: str,
-    model_id: str = "eleven_flash_v2_5",
-    output_format: str = "pcm_16000",
-    language_code: Optional[str] = None,
-    auto_mode: str = "true",
-    enable_ssml_parsing: Optional[bool] = None,
-    enable_logging: Optional[bool] = None,
-):
-    """ElevenLabs-compatible WebSocket endpoint for Pipecat"""
-    await websocket.accept()
-    
-    logger.info(f"ElevenLabs-compatible WebSocket connected: voice={voice_id}, model={model_id}")
-    
-    # Track contexts for this connection
-    contexts: Dict[str, AudioContext] = {}
-    active_context_id: Optional[str] = None
-    
-    try:
-        while True:
-            # Receive message
-            message = await websocket.receive_text()
-            
-            try:
-                data = json.loads(message)
-            except json.JSONDecodeError:
-                # Handle keepalive empty messages
-                continue
-            
-            # Handle different message types
-            if not data:
-                # Keepalive message
-                continue
-                
-            if data.get("close_socket"):
-                logger.info("Close socket requested")
-                break
-                
-            if data.get("close_context"):
-                context_id = data.get("context_id")
-                if context_id in contexts:
-                    logger.info(f"Closing context {context_id}")
-                    del contexts[context_id]
-                    if active_context_id == context_id:
-                        active_context_id = None
-                continue
-            
-            # Handle text generation
-            text = data.get("text", "").strip()
-            context_id = data.get("context_id")
-            
-            if not context_id:
-                logger.warning("No context_id provided, skipping")
-                continue
-                
-            # Handle initial space for new context
-            if text == " " and context_id not in contexts:
-                # Initialize new context
-                contexts[context_id] = AudioContext(context_id=context_id)
-                active_context_id = context_id
-                logger.info(f"Initialized new context {context_id}")
-                continue
-            
-            if not text or text == " ":
-                continue
-                
-            # Get or create context
-            if context_id not in contexts:
-                contexts[context_id] = AudioContext(context_id=context_id)
-            
-            context = contexts[context_id]
-            context.text_buffer = text
-            
-            # Get voice settings if provided
-            voice_settings = data.get("voice_settings", {})
-            speed = voice_settings.get("speed", 1.0)
-            
-            # Determine language/pipeline
-            lang_code = voice_id[0] if voice_id and voice_id[0] in PIPELINES else 'a'
-            pipeline = PIPELINES.get(lang_code, PIPELINES['a'])
-            
-            logger.info(f"Generating audio for context {context_id}: '{text}'")
-            
-            # Generate audio
-            generation_start = time.time()
-            audio_chunks = []
-            total_samples = 0
-            
-            try:
-                for graphemes, phonemes, audio in pipeline(text, voice=voice_id, speed=speed):
-                    # Convert PyTorch tensor to NumPy array if needed
-                    if hasattr(audio, 'cpu'):  # It's a PyTorch tensor
-                        audio_np = audio.cpu().numpy()
-                    else:
-                        audio_np = audio
-                    
-                    # Convert to PCM16
-                    audio_pcm = (audio_np * 32767).astype(np.int16)
-                    audio_bytes = audio_pcm.tobytes()
-                    audio_chunks.append(audio_np)
-                    total_samples += len(audio_np)
-                    
-                    # Send audio chunk immediately
-                    chunk_message = {
-                        "audio": base64.b64encode(audio_bytes).decode('utf-8'),
-                        "contextId": context_id,
-                        "isFinal": False
-                    }
-                    await websocket.send_text(json.dumps(chunk_message))
-                
-                # Calculate audio duration and create alignment
-                if audio_chunks:
-                    full_audio = np.concatenate(audio_chunks)
-                    audio_duration = len(full_audio) / 24000.0  # 24kHz sample rate
-                    audio_duration_ms = audio_duration * 1000
-                    
-                    # Send alignment data
-                    alignment = create_alignment_data(text, audio_duration_ms)
-                    alignment_message = {
-                        "alignment": alignment,
-                        "contextId": context_id
-                    }
-                    await websocket.send_text(json.dumps(alignment_message))
-                    
-                    # Update context cumulative time
-                    context.cumulative_time += audio_duration
-                
-                # Send final message
-                generation_time = time.time() - generation_start
-                final_message = {
-                    "isFinal": True,
-                    "contextId": context_id,
-                    "metadata": {
-                        "chunks": len(audio_chunks),
-                        "characters": len(text),
-                        "generation_time_ms": int(generation_time * 1000),
-                        "audio_duration_ms": int(audio_duration_ms) if audio_chunks else 0
-                    }
-                }
-                await websocket.send_text(json.dumps(final_message))
-                
-                logger.info(f"Completed generation for context {context_id} in {generation_time:.2f}s")
-                
-            except Exception as e:
-                logger.error(f"Error generating audio: {e}")
-                error_message = {
-                    "error": str(e),
-                    "contextId": context_id
-                }
-                await websocket.send_text(json.dumps(error_message))
-    
-    except WebSocketDisconnect:
-        logger.info("WebSocket disconnected by client")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-    finally:
-        logger.info(f"WebSocket connection closed. Had {len(contexts)} contexts.")
-
-# RunPod streaming handler
-def generator_handler(job: Dict[str, Any]) -> Generator[Dict[str, Any], None, None]:
+def websocket_style_handler(job: Dict[str, Any]) -> Generator[Dict[str, Any], None, None]:
     """
-    Generator handler for streaming TTS output via RunPod
+    WebSocket-style streaming handler that mimics ElevenLabs WebSocket behavior
+    Supports both single requests and multi-message conversations
     """
     job_start = time.time()
     
     try:
         job_input = job["input"]
-        text = job_input.get("text", "")
-        voice_id = job_input.get("voice_id", "af_bella")
-        speed = job_input.get("speed", 1.0)
-        output_format = job_input.get("output_format", "pcm_16000")
-        streaming = job_input.get("streaming", True)
         
-        if not text:
-            yield {"error": "No text provided"}
-            return
-        
-        # Get pipeline
-        lang_code = voice_id[0] if voice_id else 'a'
-        pipeline = PIPELINES.get(lang_code, PIPELINES['a'])
-        
-        # Send initial status
+        # Determine request type
+        if "messages" in job_input:
+            # Multi-message conversation (WebSocket-style)
+            yield from handle_websocket_conversation(job_input, job_start)
+        elif "websocket_message" in job_input:
+            # Single WebSocket-style message
+            yield from handle_websocket_message(job_input, job_start)
+        else:
+            # Traditional single TTS request
+            yield from handle_single_tts(job_input, job_start)
+            
+    except Exception as e:
+        logger.error(f"Handler error: {e}")
         yield {
-            "status": "started",
-            "text_info": {
-                "text": text,
-                "voice_id": voice_id,
-                "characters": len(text),
-            }
+            "type": "error",
+            "error": str(e),
+            "timestamp": time.time() - job_start
+        }
+
+def handle_websocket_conversation(job_input: Dict[str, Any], job_start: float) -> Generator[Dict[str, Any], None, None]:
+    """Handle conversation with multiple messages (like WebSocket session)"""
+    messages = job_input.get("messages", [])
+    context_id = job_input.get("context_id", f"conv-{int(time.time())}")
+    voice_id = job_input.get("voice_id", "af_bella")
+    voice_settings = job_input.get("voice_settings", {})
+    
+    # Send connection established event
+    yield {
+        "type": "connection_established",
+        "contextId": context_id,
+        "message_count": len(messages),
+        "timestamp": time.time() - job_start
+    }
+    
+    cumulative_time = 0.0
+    
+    # Process each message
+    for i, message in enumerate(messages):
+        if isinstance(message, str):
+            text = message
+        else:
+            text = message.get("text", "").strip()
+            
+        if not text:
+            continue
+            
+        # Send message start event
+        yield {
+            "type": "message_start",
+            "contextId": context_id,
+            "message_index": i,
+            "text": text,
+            "timestamp": time.time() - job_start
         }
         
-        # Generate audio with streaming
-        audio_chunks = []
-        chunk_count = 0
-        total_samples = 0
-        first_chunk_time = None
+        # Generate audio for this message
+        audio_duration = yield from generate_streaming_audio(
+            text, voice_id, voice_settings, context_id, job_start, 
+            message_index=i, cumulative_time=cumulative_time
+        )
         
+        if audio_duration > 0:
+            cumulative_time += audio_duration
+        
+        # Send message complete event
+        yield {
+            "type": "message_complete",
+            "contextId": context_id,
+            "message_index": i,
+            "timestamp": time.time() - job_start
+        }
+    
+    # Send conversation complete event
+    yield {
+        "type": "conversation_complete",
+        "contextId": context_id,
+        "total_messages": len(messages),
+        "total_time": time.time() - job_start,
+        "timestamp": time.time() - job_start
+    }
+
+def handle_websocket_message(job_input: Dict[str, Any], job_start: float) -> Generator[Dict[str, Any], None, None]:
+    """Handle single WebSocket-style message"""
+    ws_msg = job_input.get("websocket_message", {})
+    text = ws_msg.get("text", "").strip()
+    context_id = ws_msg.get("context_id") or ws_msg.get("contextId", f"ws-{int(time.time())}")
+    voice_settings = ws_msg.get("voice_settings", {})
+    
+    # Extract voice_id from the job input or use default
+    voice_id = job_input.get("voice_id", "af_bella")
+    
+    # Handle special WebSocket messages
+    if ws_msg.get("close_socket"):
+        yield {
+            "type": "socket_closed",
+            "contextId": context_id,
+            "timestamp": time.time() - job_start
+        }
+        return
+        
+    if ws_msg.get("close_context"):
+        yield {
+            "type": "context_closed",
+            "contextId": context_id,
+            "timestamp": time.time() - job_start
+        }
+        return
+    
+    # Handle initial space (context initialization)
+    if text == " ":
+        yield {
+            "type": "context_initialized",
+            "contextId": context_id,
+            "timestamp": time.time() - job_start
+        }
+        return
+    
+    if not text:
+        yield {
+            "type": "empty_message",
+            "contextId": context_id,
+            "timestamp": time.time() - job_start
+        }
+        return
+    
+    # Send generation start event
+    yield {
+        "type": "generation_start",
+        "contextId": context_id,
+        "text": text,
+        "character_count": len(text),
+        "timestamp": time.time() - job_start
+    }
+    
+    # Generate audio
+    yield from generate_streaming_audio(
+        text, voice_id, voice_settings, context_id, job_start
+    )
+    
+    # Send generation complete event
+    yield {
+        "type": "generation_complete",
+        "contextId": context_id,
+        "total_time": time.time() - job_start,
+        "timestamp": time.time() - job_start
+    }
+
+def handle_single_tts(job_input: Dict[str, Any], job_start: float) -> Generator[Dict[str, Any], None, None]:
+    """Handle traditional single TTS request"""
+    text = job_input.get("text", "")
+    voice_id = job_input.get("voice_id", "af_bella")
+    voice_settings = job_input.get("voice_settings", {})
+    context_id = job_input.get("context_id", f"single-{int(time.time())}")
+    
+    if not text:
+        yield {"error": "No text provided"}
+        return
+    
+    # Send start event
+    yield {
+        "type": "generation_start",
+        "contextId": context_id,
+        "text": text,
+        "voice_id": voice_id,
+        "character_count": len(text),
+        "timestamp": time.time() - job_start
+    }
+    
+    # Generate audio
+    yield from generate_streaming_audio(
+        text, voice_id, voice_settings, context_id, job_start
+    )
+    
+    # Send completion event
+    yield {
+        "type": "generation_complete",
+        "contextId": context_id,
+        "total_time": time.time() - job_start,
+        "timestamp": time.time() - job_start
+    }
+
+def generate_streaming_audio(
+    text: str,
+    voice_id: str,
+    voice_settings: Dict[str, Any],
+    context_id: str,
+    job_start: float,
+    message_index: Optional[int] = None,
+    cumulative_time: float = 0.0
+) -> Generator[Dict[str, Any], None, float]:
+    """Generate streaming audio with real-time chunk delivery"""
+    
+    # Get pipeline
+    lang_code = voice_id[0] if voice_id and voice_id[0] in PIPELINES else 'a'
+    pipeline = PIPELINES.get(lang_code, PIPELINES['a'])
+    
+    # Extract voice settings
+    speed = voice_settings.get("speed", 1.0)
+    
+    audio_chunks = []
+    chunk_count = 0
+    total_samples = 0
+    first_chunk_time = None
+    generation_start = time.time()
+    
+    try:
+        # Stream each audio chunk as it's generated
         for graphemes, phonemes, audio in pipeline(text, voice=voice_id, speed=speed):
             if first_chunk_time is None:
                 first_chunk_time = time.time() - job_start
+                
+                # Send first chunk event
+                yield {
+                    "type": "first_chunk",
+                    "contextId": context_id,
+                    "latency_ms": int(first_chunk_time * 1000),
+                    "message_index": message_index,
+                    "timestamp": time.time() - job_start
+                }
             
-            # Convert PyTorch tensor to NumPy array if needed
-            if hasattr(audio, 'cpu'):  # It's a PyTorch tensor
+            # Convert audio to proper format
+            if hasattr(audio, 'cpu'):
                 audio_np = audio.cpu().numpy()
             else:
                 audio_np = audio
@@ -363,77 +337,104 @@ def generator_handler(job: Dict[str, Any]) -> Generator[Dict[str, Any], None, No
             chunk_count += 1
             total_samples += len(audio_np)
             
-            # Stream each chunk
-            if streaming:
-                yield {
-                    "audio_chunk": base64.b64encode(audio_bytes).decode('utf-8'),
-                    "chunk_number": chunk_count,
-                    "chunk_samples": len(audio),
-                    "total_samples": total_samples,
-                    "sample_rate": 24000,
-                    "format": output_format,
-                    "timestamp": time.time() - job_start
-                }
+            # Send audio chunk (ElevenLabs-compatible format)
+            chunk_data = {
+                "audio": base64.b64encode(audio_bytes).decode('utf-8'),
+                "contextId": context_id,
+                "isFinal": False,
+                "chunk_number": chunk_count,
+                "chunk_samples": len(audio_np),
+                "total_samples": total_samples,
+                "sample_rate": 24000,
+                "format": "pcm_16000",
+                "timestamp": time.time() - job_start
+            }
+            
+            if message_index is not None:
+                chunk_data["message_index"] = message_index
+                
+            # This yield sends the chunk immediately!
+            yield chunk_data
         
-        # Final result
+        # Calculate final metrics
+        audio_duration = 0
         if audio_chunks:
             full_audio = np.concatenate(audio_chunks)
-            audio_duration = len(full_audio) / 24000.0
+            audio_duration = len(full_audio) / 24000.0  # 24kHz sample rate
+            audio_duration_ms = audio_duration * 1000
+            generation_time = time.time() - generation_start
             
-            # Encode full audio
-            if "pcm" in output_format:
-                full_audio_data = (full_audio * 32767).astype(np.int16).tobytes()
-            else:
-                import io
-                import soundfile as sf
-                buffer = io.BytesIO()
-                sf.write(buffer, full_audio, 24000, format='wav')
-                full_audio_data = buffer.getvalue()
-            
-            processing_time = time.time() - job_start
-            
-            yield {
-                "status": "completed",
-                "audio": base64.b64encode(full_audio_data).decode('utf-8'),
-                "format": output_format,
-                "sample_rate": 24000,
-                "total_chunks": chunk_count,
-                "audio_duration": audio_duration,
-                "processing_time": processing_time,
-                "first_chunk_latency": first_chunk_time,
-                "characters": len(text),
-                "real_time_factor": processing_time / audio_duration if audio_duration > 0 else 0
+            # Send alignment data (ElevenLabs-compatible)
+            alignment = create_alignment_data(text, audio_duration_ms)
+            alignment_data = {
+                "alignment": alignment,
+                "contextId": context_id,
+                "message_index": message_index,
+                "timestamp": time.time() - job_start
             }
+            yield alignment_data
+            
+            # Send final completion with audio metrics
+            completion_data = {
+                "isFinal": True,
+                "contextId": context_id,
+                "metadata": {
+                    "total_chunks": chunk_count,
+                    "audio_duration_ms": int(audio_duration_ms),
+                    "generation_time_ms": int(generation_time * 1000),
+                    "real_time_factor": generation_time / audio_duration if audio_duration > 0 else 0,
+                    "character_count": len(text),
+                    "cumulative_time": cumulative_time
+                },
+                "message_index": message_index,
+                "timestamp": time.time() - job_start
+            }
+            yield completion_data
         
+        return audio_duration
+            
     except Exception as e:
-        logger.error(f"Generator handler error: {e}")
-        yield {"error": str(e), "status": "failed"}
+        error_data = {
+            "error": str(e),
+            "contextId": context_id,
+            "message_index": message_index,
+            "timestamp": time.time() - job_start
+        }
+        yield error_data
+        return 0.0
 
-# Start servers based on environment
-if __name__ == "__main__":
-    if os.environ.get("RUNPOD_POD_ID"):
-        logger.info("Starting in RunPod mode with WebSocket server")
-        
-        # Start WebSocket server in background thread
-        def run_websocket_server():
-            uvicorn.run(
-                app,
-                host="0.0.0.0",
-                port=8000,
-                loop="uvloop",
-                log_level="info"
-            )
-        
-        websocket_thread = threading.Thread(target=run_websocket_server, daemon=True)
-        websocket_thread.start()
-        logger.info("ElevenLabs-compatible WebSocket server started on port 8000")
-        
-        # Start RunPod handler
-        runpod.serverless.start({
-            "handler": generator_handler,
-            "return_aggregate_stream": True
-        })
-    else:
-        # Local testing mode - just run WebSocket server
-        logger.info("Starting in local mode (WebSocket only)")
-        uvicorn.run(app, host="0.0.0.0", port=8000)
+# Health check handler for monitoring
+def health_handler(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "models_loaded": list(PIPELINES.keys()),
+        "load_time": f"{time.time() - LOAD_START_TIME:.2f}s",
+        "timestamp": time.time(),
+        "capabilities": [
+            "websocket_style_streaming",
+            "elevenlabs_compatible",
+            "multi_message_conversations",
+            "word_timestamps",
+            "real_time_audio_chunks"
+        ]
+    }
+
+# Route handler based on input
+def main_handler(job: Dict[str, Any]) -> Generator[Dict[str, Any], None, None]:
+    """Main router handler"""
+    job_input = job.get("input", {})
+    
+    # Route to health check
+    if job_input.get("health_check"):
+        yield health_handler(job)
+        return
+    
+    # Route to WebSocket-style handler
+    yield from websocket_style_handler(job)
+
+# Start the serverless function with streaming enabled
+runpod.serverless.start({
+    "handler": main_handler,
+    "return_aggregate_stream": True  # Critical for streaming!
+})

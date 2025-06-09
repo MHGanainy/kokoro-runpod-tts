@@ -65,15 +65,47 @@ class KokoroRunPodTester:
                         data = await response.json()
                         print(f"Endpoint health: {json.dumps(data, indent=2)}")
                         
-                        # For pod deployments, construct the WebSocket URL
-                        # RunPod pod URLs typically follow this pattern
+                        # For serverless endpoints, WebSocket might not be available
+                        # Check if this is a pod or serverless endpoint
+                        if data.get("workers", {}).get("running", 0) > 0:
+                            print("This appears to be a serverless endpoint.")
+                            print("WebSocket connections may not be available on serverless endpoints.")
+                            print("Use REST API for serverless deployments.")
+                            
+                        # Try different URL patterns
+                        # Pattern 1: pod-id-8000.proxy.runpod.net
                         if "-" in self.endpoint_id:
                             pod_id = self.endpoint_id.split("-")[0]
                             pod_url = f"https://{pod_id}-8000.proxy.runpod.net"
-                            print(f"Detected pod URL: {pod_url}")
-                            self.pod_url = pod_url
-                            self.ws_url = pod_url.replace("https://", "wss://")
-                            return pod_url
+                            print(f"Trying pod URL pattern 1: {pod_url}")
+                            
+                            # Test if the URL is accessible
+                            try:
+                                async with session.get(f"{pod_url}/", timeout=aiohttp.ClientTimeout(total=5)) as test_response:
+                                    if test_response.status == 200:
+                                        print(f"✓ Pod URL accessible: {pod_url}")
+                                        self.pod_url = pod_url
+                                        self.ws_url = pod_url.replace("https://", "wss://")
+                                        return pod_url
+                            except:
+                                pass
+                                
+                        # Pattern 2: Try the endpoint ID directly
+                        pod_url = f"https://{self.endpoint_id}-8000.proxy.runpod.net"
+                        print(f"Trying pod URL pattern 2: {pod_url}")
+                        
+                        try:
+                            async with session.get(f"{pod_url}/", timeout=aiohttp.ClientTimeout(total=5)) as test_response:
+                                if test_response.status == 200:
+                                    print(f"✓ Pod URL accessible: {pod_url}")
+                                    self.pod_url = pod_url
+                                    self.ws_url = pod_url.replace("https://", "wss://")
+                                    return pod_url
+                        except:
+                            pass
+                        
+                        print("Could not find accessible WebSocket endpoint.")
+                        print("This is normal for serverless deployments.")
                         
         except Exception as e:
             print(f"Could not detect pod URL: {e}")
@@ -167,42 +199,103 @@ class KokoroRunPodTester:
         chunk_count = 0
         first_chunk_time = None
         final_result = None
+        poll_count = 0
         
-        while True:
+        while poll_count < 60:  # Max 30 seconds
+            poll_count += 1
+            
             async with session.get(stream_url, headers=self.headers) as response:
                 if response.status != 200:
                     print(f"Stream request failed: {response.status}")
+                    error_text = await response.text()
+                    print(f"Error: {error_text}")
                     break
                     
                 stream_data = await response.json()
+                
+                if poll_count % 4 == 0:  # Print status every 2 seconds
+                    print(f"Stream status: {stream_data.get('status')}")
                 
                 if stream_data["status"] == "COMPLETED":
                     print("Streaming completed!")
                     if "output" in stream_data:
                         final_result = stream_data["output"]
+                        print(f"Final output type: {type(final_result)}")
+                        if isinstance(final_result, dict):
+                            print(f"Final output keys: {list(final_result.keys())}")
+                        elif isinstance(final_result, list):
+                            print(f"Final output is a list with {len(final_result)} items")
+                            for i, item in enumerate(final_result[:3]):  # Show first 3 items
+                                if isinstance(item, dict):
+                                    print(f"  Item {i}: {list(item.keys())}")
+                    else:
+                        print("No output in completed response")
                     break
                     
                 elif stream_data["status"] == "FAILED":
                     error = stream_data.get("error", "Unknown error")
                     print(f"Job failed: {error}")
+                    print(f"Full response: {json.dumps(stream_data, indent=2)}")
                     break
                     
-                elif stream_data["status"] == "IN_PROGRESS" and "stream" in stream_data:
-                    for output in stream_data["stream"]:
-                        if "audio_chunk" in output:
-                            if first_chunk_time is None:
-                                first_chunk_time = output.get("timestamp", time.time() - start_time)
-                                print(f"First chunk at: {first_chunk_time:.3f}s")
+                elif stream_data["status"] == "IN_PROGRESS":
+                    if "stream" in stream_data:
+                        stream_items = stream_data["stream"]
+                        if stream_items:
+                            print(f"Received {len(stream_items)} stream items")
+                            for item in stream_items:
+                                # Check if the item has an 'output' key (RunPod might wrap the actual output)
+                                if "output" in item:
+                                    output = item["output"]
+                                else:
+                                    output = item
                                 
-                            chunk_count += 1
-                            audio_bytes = base64.b64decode(output["audio_chunk"])
-                            audio_chunks.append(np.frombuffer(audio_bytes, dtype=np.int16))
-                            
-                            print(f"  Chunk {chunk_count}: {len(audio_bytes)} bytes")
+                                if isinstance(output, dict):
+                                    if "audio_chunk" in output:
+                                        if first_chunk_time is None:
+                                            first_chunk_time = output.get("timestamp", time.time() - start_time)
+                                            print(f"First chunk at: {first_chunk_time:.3f}s")
+                                            
+                                        chunk_count += 1
+                                        audio_bytes = base64.b64decode(output["audio_chunk"])
+                                        audio_chunks.append(np.frombuffer(audio_bytes, dtype=np.int16))
+                                        
+                                        print(f"  Chunk {chunk_count}: {len(audio_bytes)} bytes")
+                                    elif "status" in output and output["status"] == "completed":
+                                        # Found the final result in the stream
+                                        final_result = output
+                                        print(f"Found final result in stream: {list(output.keys())}")
+                                    elif "status" in output:
+                                        print(f"Stream output status: {output['status']}")
+                                        if output["status"] == "started":
+                                            print(f"  Info: {output.get('text_info', {})}")
+                                    elif "error" in output:
+                                        print(f"Stream error: {output}")
+                                    else:
+                                        print(f"Unknown output format: {list(output.keys())}")
+                                else:
+                                    print(f"Output is not a dict: {type(output)}")
+                    else:
+                        print("No 'stream' field in IN_PROGRESS response")
                             
             await asyncio.sleep(0.1)
             
         total_time = time.time() - start_time
+        
+        if poll_count >= 60:
+            print("Timeout waiting for stream completion")
+        
+        # If we have chunks but no final result, create one
+        if audio_chunks and not final_result:
+            print("Creating final result from chunks...")
+            full_audio = np.concatenate(audio_chunks)
+            audio_bytes = full_audio.tobytes()
+            final_result = {
+                "audio": base64.b64encode(audio_bytes).decode('utf-8'),
+                "audio_duration": len(full_audio) / 16000,  # Assuming 16kHz
+                "chunk_count": chunk_count,
+                "format": "pcm_16000"
+            }
         
         return {
             "audio_chunks": audio_chunks,
@@ -216,39 +309,67 @@ class KokoroRunPodTester:
         """Handle standard polling response from RunPod"""
         print("Polling for results...")
         
-        while True:
+        poll_count = 0
+        while poll_count < 60:  # Max 30 seconds
             await asyncio.sleep(0.5)
+            poll_count += 1
             
             async with session.get(f"{self.rest_url}/status/{job_id}", headers=self.headers) as response:
                 if response.status != 200:
                     print(f"Status check failed: {response.status}")
+                    error_text = await response.text()
+                    print(f"Error: {error_text}")
                     break
                     
                 status_data = await response.json()
                 status = status_data.get("status")
                 
+                if poll_count % 4 == 0:  # Print status every 2 seconds
+                    print(f"Job status: {status}")
+                
                 if status == "COMPLETED":
                     output = status_data.get("output", {})
                     total_time = time.time() - start_time
+                    
+                    # Handle output that might be a list (from streaming handler)
+                    if isinstance(output, list):
+                        # Look for the final 'completed' status in the list
+                        for item in output:
+                            if isinstance(item, dict) and item.get("status") == "completed" and "audio" in item:
+                                output = item
+                                break
                     
                     if "audio" in output:
                         audio_bytes = base64.b64decode(output["audio"])
                         print(f"\nCompleted in {total_time:.2f}s")
                         print(f"Audio size: {len(audio_bytes)} bytes")
                         print(f"Processing time: {output.get('processing_time', 0):.3f}s")
+                        print(f"Audio duration: {output.get('audio_duration', 0):.2f}s")
                         
                         return {
                             "audio": audio_bytes,
                             "total_time": total_time,
                             "output": output
                         }
+                    else:
+                        print(f"No audio found in output")
+                        print(f"Output type: {type(output)}")
+                        if isinstance(output, list):
+                            print(f"Output length: {len(output)}")
+                            print("Output items:")
+                            for i, item in enumerate(output):
+                                if isinstance(item, dict):
+                                    print(f"  [{i}]: {list(item.keys())}")
                     break
                     
                 elif status in ["FAILED", "CANCELLED", "TIMED_OUT"]:
                     error = status_data.get("error", "Unknown error")
                     print(f"Job {status}: {error}")
+                    print(f"Full response: {json.dumps(status_data, indent=2)}")
                     break
                     
+        if poll_count >= 60:
+            print("Timeout waiting for job completion")
         return {}
         
     async def test_websocket(
@@ -377,18 +498,29 @@ class KokoroRunPodTester:
                 
         # Test REST API (streaming)
         stream_result = await self.test_rest_api(streaming=True)
-        if stream_result and "audio_chunks" in stream_result and stream_result["audio_chunks"]:
-            results["rest_streaming"] = True
-            
-            # Play combined audio
-            if AUDIO_PLAYBACK:
-                full_audio = np.concatenate(stream_result["audio_chunks"])
-                print(f"\nPlaying streamed audio ({len(full_audio)/16000:.2f}s)...")
-                sd.play(full_audio, samplerate=16000)
-                sd.wait()
+        if stream_result:
+            if "audio_chunks" in stream_result and stream_result["audio_chunks"]:
+                results["rest_streaming"] = True
+                
+                # Play combined audio
+                if AUDIO_PLAYBACK:
+                    full_audio = np.concatenate(stream_result["audio_chunks"])
+                    print(f"\nPlaying streamed audio ({len(full_audio)/16000:.2f}s)...")
+                    sd.play(full_audio, samplerate=16000)
+                    sd.wait()
+            elif "final_result" in stream_result and stream_result["final_result"]:
+                results["rest_streaming"] = True
+                print("Streaming completed with final result")
+            else:
+                print("Streaming completed but no audio chunks received")
                 
         # Test WebSocket
-        results["websocket"] = await self.test_websocket()
+        pod_url = await self.detect_pod_url()
+        if self.pod_url or pod_url:
+            results["websocket"] = await self.test_websocket()
+        else:
+            print("\nWebSocket test skipped - not available on serverless endpoints")
+            results["websocket"] = "SKIPPED"
         
         # Summary
         print("\n" + "=" * 60)
